@@ -74,3 +74,11 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+CHROMA_HOST: str = "localhost"
+
+CHROMA_PORT: int = 8000
+
+CHROMA_COLLECTION: str = (
+    "agentflow_long_term_memory"
+)

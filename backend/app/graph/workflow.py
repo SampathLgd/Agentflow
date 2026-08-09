@@ -10,6 +10,11 @@ from app.agents.reviewer.agent import ReviewerAgent
 from app.agents.supervisor.agent import SupervisorAgent
 from app.agents.writing.agent import WritingAgent
 from app.graph.state import AgentGraphState
+from app.memory.base import WorkingMemoryStore
+from app.memory.long_term import (
+    LongTermMemory,
+    LongTermMemoryStore,
+)
 from app.schemas.agent import AgentInput
 from app.schemas.execution import Specialist, SubTask
 from app.schemas.review import ReviewResult
@@ -74,34 +79,12 @@ def route_after_specialists(
 ) -> str:
     """
     Decide what should happen after specialist execution.
-
-    Possible outcomes:
-
-    retry
-        Specialist failed and still has retry attempts.
-
-    failed
-        Specialist failed and retry limit was reached.
-
-    human_escalation
-        Specialist completed but confidence is below the
-        configured escalation threshold.
-
-    review
-        All planned subtasks completed successfully.
-
-    dispatch
-        More dependency-ready subtasks remain.
     """
 
     failure_reason = state.get(
         "failure_reason",
         "",
     )
-
-    # --------------------------------------------------------
-    # Specialist failure
-    # --------------------------------------------------------
 
     if failure_reason:
         retry_count = state.get(
@@ -119,10 +102,6 @@ def route_after_specialists(
 
         return "failed"
 
-    # --------------------------------------------------------
-    # Low-confidence specialist escalation
-    # --------------------------------------------------------
-
     confidence = state.get(
         "specialist_confidence",
         1.0,
@@ -135,10 +114,6 @@ def route_after_specialists(
 
     if confidence < confidence_threshold:
         return "human_escalation"
-
-    # --------------------------------------------------------
-    # Successful specialist execution
-    # --------------------------------------------------------
 
     plan = state["plan"]
 
@@ -199,13 +174,6 @@ def route_after_review(
 ) -> str:
     """
     Route execution after reviewer evaluation.
-
-    Routing priority:
-
-    1. Low confidence -> escalation
-    2. Approved -> synthesis
-    3. Rejected with retries available -> retry
-    4. Rejected after retry limit -> failed
     """
 
     review = state.get("review")
@@ -214,10 +182,6 @@ def route_after_review(
         raise ValueError(
             "Review result is required for review routing."
         )
-
-    # --------------------------------------------------------
-    # Reviewer confidence
-    # --------------------------------------------------------
 
     confidence = float(
         getattr(
@@ -237,10 +201,6 @@ def route_after_review(
     if confidence < escalation_threshold:
         return "escalate"
 
-    # --------------------------------------------------------
-    # Approved review
-    # --------------------------------------------------------
-
     approved = bool(
         getattr(
             review,
@@ -251,10 +211,6 @@ def route_after_review(
 
     if approved:
         return "synthesis"
-
-    # --------------------------------------------------------
-    # Rejected review
-    # --------------------------------------------------------
 
     retry_count = int(
         state.get(
@@ -278,42 +234,49 @@ def route_after_review(
 
     return "review_failed"
 
+
+# ============================================================
+# Reviewer escalation
+# ============================================================
+
+
 async def escalate(
-        state: AgentGraphState,
-    ) -> dict[str, Any]:
-        """
-        Phase 1 reviewer-confidence escalation boundary.
+    state: AgentGraphState,
+) -> dict[str, Any]:
+    """
+    Phase 1 reviewer-confidence escalation boundary.
 
-        Persistent human approval/replan behavior will be
-        implemented in the HITL phase.
-        """
+    Persistent human approval/replan behavior is deferred
+    to the HITL phase.
+    """
 
-        review = state.get(
-            "review"
-        )
+    review = state.get(
+        "review"
+    )
 
-        confidence = (
-            float(
-                getattr(
-                    review,
-                    "confidence",
-                    0.0,
-                )
+    confidence = (
+        float(
+            getattr(
+                review,
+                "confidence",
+                0.0,
             )
-            if review is not None
-            else 0.0
         )
+        if review is not None
+        else 0.0
+    )
 
-        return {
-            "escalation_required": True,
-            "escalation_reason": (
-                "Reviewer confidence "
-                f"{confidence:.2f} is below the "
-                "configured threshold "
-                f"{state.get('confidence_threshold', 0.5):.2f}."
-            ),
-            "replan_required": True,
-        }
+    return {
+        "escalation_required": True,
+        "escalation_reason": (
+            "Reviewer confidence "
+            f"{confidence:.2f} is below the "
+            "configured threshold "
+            f"{state.get('confidence_threshold', 0.5):.2f}."
+        ),
+        "replan_required": True,
+    }
+
 
 # ============================================================
 # Workflow construction
@@ -327,9 +290,14 @@ def build_workflow(
     writing_agent: WritingAgent,
     coding_agent: CodeExecutionAgent,
     reviewer_agent: ReviewerAgent,
+    working_memory: WorkingMemoryStore | None = None,
+    long_term_memory: LongTermMemoryStore | None = None,
 ):
     """
     Build the AgentFlow orchestration graph.
+
+    Working memory is injected as an infrastructure dependency
+    rather than being placed inside LangGraph state.
 
     Flow:
 
@@ -347,20 +315,118 @@ def build_workflow(
                     ↓      ↓       ↓
                 specialist END     END
 
-    Low-confidence specialist outputs are routed to the
-    human_escalation boundary.
+    Working memory lifecycle:
 
-    Low-confidence reviewer outputs are routed to the
-    Phase 1 escalation boundary.
-
-    Persistent HITL resume/replan behavior is intentionally
-    deferred to the HITL phase.
+        planning
+            ↓
+        save plan
+            ↓
+        specialists
+            ↓
+        save outputs/errors/intermediate results
+            ↓
+        review
+            ↓
+        synthesis/failure
+            ↓
+        clear task memory
     """
 
     graph = StateGraph(
         AgentGraphState
     )
 
+    # ========================================================
+    # Working-memory helpers
+    # ========================================================
+
+    async def _save_error(
+        state: AgentGraphState,
+        message: str,
+        *,
+        source: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Record an error if working memory is configured.
+        """
+
+        if working_memory is None:
+            return
+
+        await working_memory.add_error(
+            state["task_id"],
+            message,
+            source=source,
+            metadata=metadata,
+        )
+
+    async def _clear_memory(
+        state: AgentGraphState,
+    ) -> None:
+        """
+        Clear task-scoped working memory.
+
+        This is intentionally a no-op when working memory
+        has not been configured.
+        """
+
+        if working_memory is None:
+            return
+
+        await working_memory.clear(
+            state["task_id"]
+        )
+
+    # ========================================================
+    # Long-term memory retrieval
+    # ========================================================
+
+    async def retrieve_long_term_memory(
+        state: AgentGraphState,
+    ) -> dict[str, Any]:
+        """
+        Retrieve relevant memories from previous executions
+        for the current user.
+
+        Long-term memory is optional. If it is not configured,
+        the workflow continues normally.
+        """
+
+        if long_term_memory is None:
+            return {
+                "long_term_memories": [],
+            }
+
+        user_id = state.get(
+            "user_id",
+            "",
+        )
+
+        if not user_id:
+            return {
+                "long_term_memories": [],
+            }
+
+        results = await long_term_memory.search(
+            user_id=user_id,
+            query=state["description"],
+            limit=5,
+        )
+
+        memories = [
+            {
+                "memory": result.memory.model_dump(
+                    mode="json"
+                ),
+                "distance": result.distance,
+            }
+            for result in results
+        ]
+
+        return {
+            "long_term_memories": memories,
+        }
     # ========================================================
     # Planning
     # ========================================================
@@ -370,11 +436,19 @@ def build_workflow(
     ) -> dict[str, Any]:
         """
         Ask the supervisor to create the execution plan.
+
+        The plan is also persisted into task-scoped working memory.
         """
 
         agent_input = AgentInput(
-            task_id=state["task_id"],
+             task_id=state["task_id"],
             description=state["description"],
+            context={
+                "long_term_memories": state.get(
+                    "long_term_memories",
+                    [],
+                ),
+            },
         )
 
         plan = await supervisor.create_plan(
@@ -388,11 +462,28 @@ def build_workflow(
             completed_ids,
         )
 
+        # ----------------------------------------------------
+        # Working memory: save execution plan
+        # ----------------------------------------------------
+
+        if working_memory is not None:
+            await working_memory.set_plan(
+                state["task_id"],
+                plan.model_dump(
+                    mode="json"
+                ),
+            )
+
         return {
             "plan": plan,
             "ready_subtasks": ready,
             "completed_subtasks": [],
             "specialist_outputs": [],
+
+            "long_term_memories": state.get(
+                "long_term_memories",
+                [],
+            ),
 
             # Specialist retry state.
             "retry_count": 0,
@@ -417,6 +508,11 @@ def build_workflow(
                 "confidence_threshold",
                 0.5,
             ),
+
+            # Escalation state.
+            "human_escalation_required": False,
+            "escalation_required": False,
+            "replan_required": False,
         }
 
     # ========================================================
@@ -469,6 +565,11 @@ def build_workflow(
     ) -> dict[str, Any]:
         """
         Execute one dependency-ready specialist subtask.
+
+        Working memory receives:
+        - successful output
+        - intermediate result
+        - failures
         """
 
         subtask = state[
@@ -482,6 +583,10 @@ def build_workflow(
             context={
                 "required_inputs": (
                     subtask.required_inputs
+                ),
+                "long_term_memories": state.get(
+                    "long_term_memories",
+                    [],
                 ),
                 "expected_output": (
                     subtask.expected_output
@@ -516,14 +621,34 @@ def build_workflow(
             subtask.assigned_specialist
         ]
 
+        # ----------------------------------------------------
+        # Execute specialist
+        # ----------------------------------------------------
+
         try:
             output = await agent.run(
                 agent_input
             )
 
         except Exception as exc:
+            error_message = str(exc)
+
+            await _save_error(
+                state,
+                error_message,
+                source=(
+                    f"specialist:"
+                    f"{subtask.assigned_specialist.value}"
+                ),
+                metadata={
+                    "subtask_id": str(
+                        subtask.id
+                    ),
+                },
+            )
+
             return {
-                "failure_reason": str(exc),
+                "failure_reason": error_message,
                 "retry_count": (
                     state.get(
                         "retry_count",
@@ -539,11 +664,27 @@ def build_workflow(
         # ----------------------------------------------------
 
         if not output.success:
-            return {
-                "failure_reason": (
-                    output.content
-                    or "Specialist execution failed."
+            failure_reason = (
+                output.content
+                or "Specialist execution failed."
+            )
+
+            await _save_error(
+                state,
+                failure_reason,
+                source=(
+                    f"specialist:"
+                    f"{subtask.assigned_specialist.value}"
                 ),
+                metadata={
+                    "subtask_id": str(
+                        subtask.id
+                    ),
+                },
+            )
+
+            return {
+                "failure_reason": failure_reason,
                 "retry_count": (
                     state.get(
                         "retry_count",
@@ -568,11 +709,30 @@ def build_workflow(
             else 1.0
         )
 
+        serialized_output = output.model_dump(
+            mode="json"
+        )
+
+        # ----------------------------------------------------
+        # Working memory: save completed output
+        # ----------------------------------------------------
+
+        if working_memory is not None:
+            await working_memory.add_subtask_output(
+                state["task_id"],
+                serialized_output,
+            )
+
+            # Intermediate result keyed by subtask.
+            await working_memory.set_intermediate_result(
+                state["task_id"],
+                str(subtask.id),
+                serialized_output,
+            )
+
         return {
             "specialist_outputs": [
-                output.model_dump(
-                    mode="json"
-                ),
+                serialized_output,
             ],
             "completed_subtasks": [
                 str(subtask.id),
@@ -627,6 +787,9 @@ def build_workflow(
 
         Persistent human approval/resume behavior will be
         implemented in the HITL phase.
+
+        Memory is intentionally retained here because the
+        task has not completed yet.
         """
 
         return {
@@ -638,12 +801,6 @@ def build_workflow(
                 f"{state.get('confidence_threshold', 0.5):.2f}."
             ),
         }
-
-    # ========================================================
-    # Reviewer escalation boundary
-    # ========================================================
-
-    
 
     # ========================================================
     # Review
@@ -673,13 +830,32 @@ def build_workflow(
             },
         )
 
-        result = await reviewer_agent.run(
-            review_input
-        )
+        try:
+            result = await reviewer_agent.run(
+                review_input
+            )
 
-        review_result = parse_review_result(
-            result.metadata
-        )
+            review_result = parse_review_result(
+                result.metadata
+            )
+
+        except Exception as exc:
+            await _save_error(
+                state,
+                str(exc),
+                source="reviewer",
+            )
+            raise
+
+        # Save reviewer decision as an intermediate result.
+        if working_memory is not None:
+            await working_memory.set_intermediate_result(
+                state["task_id"],
+                "review",
+                review_result.model_dump(
+                    mode="json"
+                ),
+            )
 
         return {
             "review": review_result,
@@ -732,6 +908,11 @@ def build_workflow(
     ) -> dict[str, Any]:
         """
         Combine specialist outputs into the final response.
+
+        On successful completion:
+
+        1. Persist a useful execution memory to Chroma.
+        2. Clear task-scoped working memory.
         """
 
         outputs = state.get(
@@ -744,14 +925,84 @@ def build_workflow(
             for output in outputs
         )
 
+        # ----------------------------------------------------
+        # Long-term memory
+        # ----------------------------------------------------
+
+        if (
+            long_term_memory is not None
+            and state.get("user_id")
+            and content.strip()
+        ):
+            memory = LongTermMemory(
+                id=(
+                    f"{state['task_id']}"
+                    "-successful-execution"
+                ),
+                user_id=state["user_id"],
+                task_id=state["task_id"],
+                memory_type="successful_approach",
+                content=(
+                    f"Task:\n"
+                    f"{state['description']}\n\n"
+                    f"Successful result:\n"
+                    f"{content}"
+                ),
+                metadata={
+                    "specialist_outputs": len(
+                        outputs
+                    ),
+                    "source": "workflow_synthesis",
+                },
+                importance_score=0.8,
+            )
+
+            await long_term_memory.add(
+                memory
+            )
+
+        # ----------------------------------------------------
+        # Clear short-term working memory
+        # ----------------------------------------------------
+
+        await _clear_memory(
+            state
+        )
+
         return {
             "final_output": content,
+        }
+
+       
+    # ========================================================
+    # Failed review cleanup
+    # ========================================================
+
+    async def review_failed(
+        state: AgentGraphState,
+    ) -> dict[str, Any]:
+        """
+        Terminal cleanup for a review that exhausted retries.
+        """
+
+        await _clear_memory(
+            state
+        )
+
+        return {
+            "error": (
+                "Reviewer rejected the result after "
+                "the maximum number of retries."
+            ),
         }
 
     # ========================================================
     # Graph nodes
     # ========================================================
-
+    graph.add_node(
+        "retrieve_long_term_memory",
+        retrieve_long_term_memory,
+    )
     graph.add_node(
         "planning",
         planning,
@@ -788,6 +1039,11 @@ def build_workflow(
     )
 
     graph.add_node(
+        "review_failed",
+        review_failed,
+    )
+
+    graph.add_node(
         "synthesis",
         synthesis,
     )
@@ -798,6 +1054,11 @@ def build_workflow(
 
     graph.add_edge(
         START,
+        "retrieve_long_term_memory",
+    )
+
+    graph.add_edge(
+        "retrieve_long_term_memory",
         "planning",
     )
 
@@ -839,7 +1100,7 @@ def build_workflow(
         {
             "synthesis": "synthesis",
             "review_retry": "retry_after_review",
-            "review_failed": END,
+            "review_failed": "review_failed",
             "escalate": "escalate",
         },
     )
@@ -854,6 +1115,12 @@ def build_workflow(
     graph.add_edge(
         "retry_after_review",
         "specialist",
+    )
+
+    # Failed review → cleanup → END.
+    graph.add_edge(
+        "review_failed",
+        END,
     )
 
     # Synthesis → END.

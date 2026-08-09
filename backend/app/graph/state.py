@@ -11,11 +11,18 @@ from app.schemas.review import ReviewResult
 class AgentGraphState(TypedDict, total=False):
     """
     Shared state for the LangGraph orchestration workflow.
+
+    Infrastructure dependencies such as Redis working memory are
+    intentionally NOT stored in graph state. They are injected into
+    the compiled workflow and accessed by node closures.
     """
 
     task_id: str
     user_id: str
     description: str
+
+    # Relevant long-term memories retrieved for this task.
+    long_term_memories: list[dict[str, Any]]
 
     plan: ExecutionPlan
 
@@ -50,6 +57,20 @@ class AgentGraphState(TypedDict, total=False):
     max_retries: int
     failure_reason: str
     retry_feedback: str
+
+    # Specialist confidence.
+    specialist_confidence: float
+
+    # Confidence threshold used for escalation.
+    confidence_threshold: float
+
+    # Specialist confidence escalation.
+    human_escalation_required: bool
+    escalation_reason: str
+
+    # Reviewer confidence escalation.
+    escalation_required: bool
+    replan_required: bool
 
     final_output: str
 
