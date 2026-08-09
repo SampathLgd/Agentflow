@@ -8,3 +8,6 @@ __pycache__/
 !.env.example
 .vscode/
 .idea/
+
+# Chroma local data
+chroma-data/
