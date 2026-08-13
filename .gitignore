@@ -11,3 +11,6 @@ __pycache__/
 
 # Chroma local data
 chroma-data/
+
+# Local Chroma runtime data
+chroma/

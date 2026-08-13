@@ -8,6 +8,28 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     environment: str = "development"
 
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_database: str = "agentflow"
+    postgres_user: str = "postgres"
+    postgres_password: str | None = None
+
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_database: int = 0
+    redis_password: str | None = None
+
+    chroma_host: str = "localhost"
+    chroma_port: int = 8001
+    chroma_collection: str = (
+        "agentflow_long_term_memory"
+    )
+
+    workspace_root: str = "."
+    database_path: str = "agentflow.db"
+    allowed_api_hosts: str = ""
+    code_execution_timeout_seconds: float = 5.0
+
     # ---------------------------------------------------------
     # LLM Provider Routing
     # ---------------------------------------------------------
@@ -69,16 +91,47 @@ class Settings(BaseSettings):
             for provider in self.llm_provider_order.split(",")
             if provider.strip()
         ]
+    @property
+    def postgres_async_url(self) -> str:
+            if not self.postgres_password:
+                raise ValueError(
+                    "POSTGRES_PASSWORD must be configured."
+                )
+
+            return (
+                "postgresql+asyncpg://"
+                f"{self.postgres_user}:"
+                f"{self.postgres_password}@"
+                f"{self.postgres_host}:"
+                f"{self.postgres_port}/"
+                f"{self.postgres_database}"
+            )
+    @property
+    def redis_url(self) -> str:
+        if self.redis_password:
+            return (
+                "redis://:"
+                f"{self.redis_password}@"
+                f"{self.redis_host}:"
+                f"{self.redis_port}/"
+                f"{self.redis_database}"
+            )
+
+        return (
+            "redis://"
+            f"{self.redis_host}:"
+            f"{self.redis_port}/"
+            f"{self.redis_database}"
+        )
+    @property
+    def allowed_api_host_set(self) -> set[str]:
+        return {
+            host.strip().lower()
+            for host in self.allowed_api_hosts.split(",")
+            if host.strip()
+        }
 
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
-CHROMA_HOST: str = "localhost"
-
-CHROMA_PORT: int = 8000
-
-CHROMA_COLLECTION: str = (
-    "agentflow_long_term_memory"
-)

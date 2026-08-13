@@ -18,7 +18,7 @@ class ChromaLongTermMemoryStore(
     """
     ChromaDB-backed long-term semantic memory.
 
-    The adapter supports both:
+    Supports both:
 
     - synchronous Chroma collections
     - asynchronous test/fake collections
@@ -32,9 +32,9 @@ class ChromaLongTermMemoryStore(
     ) -> None:
         self.collection = collection
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Collection adapter
-    # ---------------------------------------------------------
+    # =========================================================
 
     async def _call_collection(
         self,
@@ -42,18 +42,6 @@ class ChromaLongTermMemoryStore(
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        """
-        Call a Chroma collection method.
-
-        Real Chroma HttpClient collections expose synchronous
-        collection methods.
-
-        Our unit-test fake exposes asynchronous methods.
-
-        Support both without leaking that implementation
-        detail into the rest of the store.
-        """
-
         method = getattr(
             self.collection,
             method_name,
@@ -69,37 +57,62 @@ class ChromaLongTermMemoryStore(
 
         return result
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Serialization
-    # ---------------------------------------------------------
+    # =========================================================
 
     @staticmethod
     def _metadata(
         memory: LongTermMemory,
     ) -> dict[str, Any]:
         """
-        Convert application metadata into Chroma-compatible
+        Convert application memory into Chroma-compatible
         scalar metadata.
         """
 
+        metadata_json = dict(
+            memory.metadata
+        )
+
+        # Keep the original importance explicitly available
+        # for lifecycle scoring.
+        metadata_json.setdefault(
+            "_base_importance",
+            float(
+                memory.importance_score
+            ),
+        )
+
         return {
             "user_id": memory.user_id,
-            "task_id": memory.task_id or "",
-            "memory_type": memory.memory_type,
+
+            "task_id": (
+                memory.task_id
+                or ""
+            ),
+
+            "memory_type": (
+                memory.memory_type
+            ),
+
             "importance_score": float(
                 memory.importance_score
             ),
+
             "created_at": (
                 memory.created_at.isoformat()
             ),
+
             "last_accessed_at": (
                 memory.last_accessed_at.isoformat()
             ),
+
             "access_count": int(
                 memory.access_count
             ),
+
             "metadata_json": json.dumps(
-                memory.metadata,
+                metadata_json,
                 default=str,
             ),
         }
@@ -112,8 +125,7 @@ class ChromaLongTermMemoryStore(
         metadata: dict[str, Any],
     ) -> LongTermMemory:
         """
-        Reconstruct the application memory model from
-        Chroma metadata.
+        Reconstruct application memory from Chroma metadata.
         """
 
         raw_metadata = metadata.get(
@@ -132,7 +144,9 @@ class ChromaLongTermMemoryStore(
             extra_metadata = {}
 
         created_at = datetime.fromisoformat(
-            str(metadata["created_at"])
+            str(
+                metadata["created_at"]
+            )
         )
 
         last_accessed_at = (
@@ -145,29 +159,51 @@ class ChromaLongTermMemoryStore(
             )
         )
 
+        importance_score = float(
+            metadata.get(
+                "importance_score",
+                0.5,
+            )
+        )
+
+        # Backward compatibility for memories created before
+        # _base_importance was introduced.
+        extra_metadata.setdefault(
+            "_base_importance",
+            importance_score,
+        )
+
         return LongTermMemory(
             id=memory_id,
+
             user_id=str(
                 metadata["user_id"]
             ),
+
             task_id=(
-                str(metadata["task_id"])
-                if metadata.get("task_id")
+                str(
+                    metadata["task_id"]
+                )
+                if metadata.get(
+                    "task_id"
+                )
                 else None
             ),
+
             memory_type=str(
                 metadata["memory_type"]
             ),
+
             content=document,
+
             metadata=extra_metadata,
-            importance_score=float(
-                metadata.get(
-                    "importance_score",
-                    0.5,
-                )
-            ),
+
+            importance_score=importance_score,
+
             created_at=created_at,
+
             last_accessed_at=last_accessed_at,
+
             access_count=int(
                 metadata.get(
                     "access_count",
@@ -176,9 +212,9 @@ class ChromaLongTermMemoryStore(
             ),
         )
 
-    # ---------------------------------------------------------
-    # Add
-    # ---------------------------------------------------------
+    # =========================================================
+    # Add / Upsert
+    # =========================================================
 
     async def add(
         self,
@@ -186,22 +222,26 @@ class ChromaLongTermMemoryStore(
     ) -> None:
         """
         Insert or update a semantic memory.
-
-        Chroma's upsert provides idempotent writes.
         """
 
         await self._call_collection(
             "upsert",
-            ids=[memory.id],
-            documents=[memory.content],
+            ids=[
+                memory.id
+            ],
+            documents=[
+                memory.content
+            ],
             metadatas=[
-                self._metadata(memory)
+                self._metadata(
+                    memory
+                )
             ],
         )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Search
-    # ---------------------------------------------------------
+    # =========================================================
 
     async def search(
         self,
@@ -243,7 +283,9 @@ class ChromaLongTermMemoryStore(
 
         results = await self._call_collection(
             "query",
-            query_texts=[query],
+            query_texts=[
+                query
+            ],
             n_results=limit,
             where=where,
         )
@@ -283,13 +325,17 @@ class ChromaLongTermMemoryStore(
                     document=str(
                         documents[index]
                     ),
-                    metadata=metadatas[index],
+                    metadata=metadatas[
+                        index
+                    ],
                 )
             )
 
             distance = None
 
-            if index < len(distances):
+            if index < len(
+                distances
+            ):
                 distance = float(
                     distances[index]
                 )
@@ -303,9 +349,9 @@ class ChromaLongTermMemoryStore(
 
         return output
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Delete
-    # ---------------------------------------------------------
+    # =========================================================
 
     async def delete(
         self,
@@ -313,40 +359,98 @@ class ChromaLongTermMemoryStore(
     ) -> None:
         await self._call_collection(
             "delete",
-            ids=[memory_id],
+            ids=[
+                memory_id
+            ],
         )
 
     async def delete_user(
         self,
         user_id: str,
     ) -> None:
-        """
-        Delete every semantic memory belonging to a user.
-        """
-
         await self._call_collection(
             "delete",
             where={
                 "user_id": user_id,
             },
         )
+    async def list_user_memories(
+        self,
+        *,
+        user_id: str,
+        limit: int = 1000,
+    ) -> list[LongTermMemory]:
+        """
+        Return all available memories for a user up to `limit`.
 
-    # ---------------------------------------------------------
+        Unlike semantic search, this operation does not depend
+        on query similarity and is therefore suitable for
+        dashboard/statistics calculations.
+        """
+
+        if not user_id.strip():
+            raise ValueError(
+                "user_id cannot be empty."
+            )
+
+        if limit < 1:
+            raise ValueError(
+                "limit must be at least 1."
+            )
+
+        result = await self._call_collection(
+            "get",
+            where={
+                "user_id": user_id,
+            },
+            limit=limit,
+            include=[
+                "documents",
+                "metadatas",
+            ],
+        )
+
+        ids = result.get(
+            "ids",
+            [],
+        )
+
+        documents = result.get(
+            "documents",
+            [],
+        )
+
+        metadatas = result.get(
+            "metadatas",
+            [],
+        )
+
+        memories: list[
+            LongTermMemory
+        ] = []
+
+        for index, memory_id in enumerate(ids):
+            memories.append(
+                self._memory_from_record(
+                    memory_id=str(
+                        memory_id
+                    ),
+                    document=str(
+                        documents[index]
+                    ),
+                    metadata=metadatas[index],
+                )
+            )
+
+        return memories
+    # =========================================================
     # Count
-    # ---------------------------------------------------------
+    # =========================================================
 
     async def count(
         self,
         user_id: str,
     ) -> int:
-        """
-        Return the number of memories belonging to a user.
-
-        Chroma does not expose a filtered count consistently
-        across client versions, so retrieve IDs using the
-        user filter and count them.
-        """
-
         result = await self._call_collection(
             "get",
             where={

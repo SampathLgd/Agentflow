@@ -117,3 +117,22 @@ class LongTermMemoryStore(ABC):
         Return the number of memories belonging to a user.
         """
         raise NotImplementedError
+
+
+    async def list_user_memories(
+        self,
+        *,
+        user_id: str,
+        limit: int = 1000,
+    ) -> list[LongTermMemory]:
+        """
+        Optional user-scoped memory listing capability.
+
+        Concrete stores that support dashboard/lifecycle
+        enumeration should override this method.
+        """
+
+        raise NotImplementedError(
+            "This memory store does not support "
+            "listing user memories."
+        )

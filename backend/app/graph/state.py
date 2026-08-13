@@ -1,5 +1,6 @@
-import operator
+from __future__ import annotations
 
+import operator
 from typing import Annotated, Any
 
 from typing_extensions import TypedDict
@@ -9,27 +10,19 @@ from app.schemas.review import ReviewResult
 
 
 class AgentGraphState(TypedDict, total=False):
-    """
-    Shared state for the LangGraph orchestration workflow.
-
-    Infrastructure dependencies such as Redis working memory are
-    intentionally NOT stored in graph state. They are injected into
-    the compiled workflow and accessed by node closures.
-    """
-
     task_id: str
     user_id: str
     description: str
 
-    # Relevant long-term memories retrieved for this task.
+    # Memory
     long_term_memories: list[dict[str, Any]]
 
+    # Planning
     plan: ExecutionPlan
-
     ready_subtasks: list[SubTask]
-
     current_subtask: SubTask
 
+    # Specialist execution
     completed_subtasks: Annotated[
         list[str],
         operator.add,
@@ -40,38 +33,70 @@ class AgentGraphState(TypedDict, total=False):
         operator.add,
     ]
 
-    # Structured reviewer decision.
+    # Reviewer
     review: ReviewResult
-
-    # Feedback from reviewer rejection.
     review_feedback: str
 
-    # Number of reviewer-driven retries.
     review_retry_count: int
-
-    # Maximum reviewer rejection retries.
     max_review_retries: int
 
-    # Specialist failure/retry state.
+    # Specialist retry
     retry_count: int
     max_retries: int
+
     failure_reason: str
     retry_feedback: str
 
-    # Specialist confidence.
+    # Confidence
     specialist_confidence: float
-
-    # Confidence threshold used for escalation.
     confidence_threshold: float
 
-    # Specialist confidence escalation.
+    # Escalation
     human_escalation_required: bool
-    escalation_reason: str
-
-    # Reviewer confidence escalation.
     escalation_required: bool
+    escalation_reason: str
     replan_required: bool
 
-    final_output: str
+    # HITL
+    resume_node: str
+    resume_subtask_id: str | None
 
+    human_decision_status: str
+    human_decision: str | None
+    human_feedback: str | None
+
+    # HITL approval policy
+
+
+    approval_level: str
+    escalation_trigger: str
+    proposed_action: str
+
+    # Resume control
+    resume_from_human: bool
+
+    # Final result
+    final_output: str
     error: str
+    execution_status: str
+
+
+class SpecialistBranchState(TypedDict, total=False):
+    task_id: str
+    user_id: str
+    description: str
+
+    plan: ExecutionPlan
+    current_subtask: SubTask
+
+    specialist_outputs: list[dict[str, Any]]
+    long_term_memories: list[dict[str, Any]]
+
+    retry_count: int
+    max_retries: int
+
+    failure_reason: str
+    retry_feedback: str
+    review_feedback: str
+
+    confidence_threshold: float

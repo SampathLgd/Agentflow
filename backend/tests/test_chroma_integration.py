@@ -13,8 +13,10 @@ from app.memory.long_term import (
 )
 
 
-CHROMA_HOST = "localhost"
-CHROMA_PORT = 8000
+import os
+
+CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8001"))
 
 
 @pytest.fixture
