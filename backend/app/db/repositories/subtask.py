@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from uuid import UUID
 
 from sqlalchemy import insert, select
@@ -8,7 +10,12 @@ from app.db.models.subtask import (
     SubTaskModel,
     subtask_dependencies,
 )
-from app.schemas.execution import SubTask
+from app.schemas.execution import (
+    Complexity,
+    ExecutionPlan,
+    Specialist,
+    SubTask,
+)
 
 
 class SubTaskRepository:
@@ -39,7 +46,6 @@ class SubTaskRepository:
         )
 
         self.session.add(model)
-
         await self.session.flush()
 
         return model
@@ -57,7 +63,6 @@ class SubTaskRepository:
                 execution_id=execution_id,
                 subtask=subtask,
             )
-
             models.append(model)
 
         await self._save_dependencies(
@@ -83,6 +88,83 @@ class SubTaskRepository:
         )
 
         return result.scalar_one_or_none()
+
+    async def list_by_execution(
+        self,
+        execution_id: UUID,
+    ) -> list[SubTaskModel]:
+        """
+        Load all persisted subtasks belonging to an execution.
+        Dependencies are eagerly loaded so the complete plan can
+        be reconstructed after Redis working memory is lost.
+        """
+
+        result = await self.session.execute(
+            select(SubTaskModel)
+            .options(
+                selectinload(
+                    SubTaskModel.dependencies
+                )
+            )
+            .where(
+                SubTaskModel.execution_id
+                == execution_id
+            )
+        )
+
+        return list(
+            result.scalars().all()
+        )
+
+    async def get_execution_plan(
+        self,
+        *,
+        execution_id: UUID,
+        task_id: UUID,
+    ) -> ExecutionPlan | None:
+        """
+        Reconstruct the execution plan from PostgreSQL.
+        """
+
+        models = await self.list_by_execution(
+            execution_id
+        )
+
+        if not models:
+            return None
+
+        subtasks: list[SubTask] = []
+
+        for model in models:
+            dependency_ids = [
+                dependency.id
+                for dependency in (
+                    model.dependencies or []
+                )
+            ]
+
+            subtasks.append(
+                SubTask(
+                    id=model.id,
+                    description=model.description,
+                    assigned_specialist=Specialist(
+                        model.assigned_specialist
+                    ),
+                    required_inputs=list(
+                        model.required_inputs or []
+                    ),
+                    expected_output=model.expected_output,
+                    estimated_complexity=Complexity(
+                        model.estimated_complexity
+                    ),
+                    dependencies=dependency_ids,
+                )
+            )
+
+        return ExecutionPlan(
+            task_id=task_id,
+            subtasks=subtasks,
+        )
 
     async def _save_dependencies(
         self,

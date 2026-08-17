@@ -16,17 +16,8 @@ def create_llm(
     """
     Create an LLM for a specific provider.
 
-    This function is intentionally unaware of task assignment
-    and fallback logic. That responsibility belongs to the
-    LLM router.
-
-    Parameters
-    ----------
-    settings:
-        Application configuration.
-
-    provider:
-        Provider name, e.g. "gemini" or "openrouter".
+    Provider selection and fallback logic remain the responsibility
+    of LLMRouter.
     """
 
     provider = provider.lower().strip()
@@ -36,7 +27,6 @@ def create_llm(
     # ---------------------------------------------------------
 
     if provider == "gemini":
-
         if not settings.gemini_api_key:
             raise LLMProviderError(
                 "GEMINI_API_KEY is required when "
@@ -53,7 +43,6 @@ def create_llm(
     # ---------------------------------------------------------
 
     if provider == "openrouter":
-
         if not settings.openrouter_api_key:
             raise LLMProviderError(
                 "OPENROUTER_API_KEY is required when "
@@ -65,6 +54,11 @@ def create_llm(
             api_key=settings.openrouter_api_key,
             base_url=OPENROUTER_BASE_URL,
             temperature=settings.planner_temperature,
+            extra_body={
+                "usage": {
+                    "include": True,
+                }
+            },
         )
 
     # ---------------------------------------------------------

@@ -319,7 +319,123 @@ async def test_compiled_workflow_runs_end_to_end():
     )
 
     assert len(research_agent.calls) == 1
+@pytest.mark.asyncio
+async def test_replay_override_changes_selected_specialist_input():
+    task_id = uuid4()
 
+    plan = create_plan(task_id)
+
+    supervisor = FakeSupervisor(plan)
+
+    research_agent = FakeSpecialistAgent(
+        specialist=Specialist.RESEARCH,
+        content="Replay research completed.",
+    )
+
+    analysis_agent = FakeSpecialistAgent(
+        specialist=Specialist.DATA_ANALYSIS,
+        content="Analysis completed successfully.",
+    )
+
+    writing_agent = FakeSpecialistAgent(
+        specialist=Specialist.WRITING,
+        content="Writing completed successfully.",
+    )
+
+    coding_agent = FakeSpecialistAgent(
+        specialist=Specialist.CODE_EXECUTION,
+        content="Code execution completed successfully.",
+    )
+
+    reviewer = FakeReviewer()
+
+    long_term_memory = FakeLongTermMemoryStore()
+
+    workflow = build_workflow(
+        supervisor=supervisor,
+        research_agent=research_agent,
+        analysis_agent=analysis_agent,
+        writing_agent=writing_agent,
+        coding_agent=coding_agent,
+        reviewer_agent=reviewer,
+        long_term_memory=long_term_memory,
+    )
+
+    subtask = plan.subtasks[0]
+
+    replay_description = (
+        "Changed research question for replay."
+    )
+
+    replay_override = {
+        "description": replay_description,
+        "context": {
+            "required_inputs": [
+                "Replay-specific production context"
+            ],
+            "custom_context": "replay-test",
+        },
+    }
+
+    result = await workflow.ainvoke(
+        {
+            "task_id": str(task_id),
+            "user_id": "test-user",
+            "description": "Original task description.",
+            "plan": plan,
+            "current_subtask": subtask,
+            "ready_subtasks": [subtask],
+            "specialist_outputs": [],
+            "long_term_memories": [],
+            "retry_count": 0,
+            "retry_feedback": "",
+            "review_feedback": "",
+            "replay_source_execution_id": str(
+                uuid4()
+            ),
+            "replay_source_span_id": "source-span-123",
+            "replay_target_subtask_id": str(
+                subtask.id
+            ),
+            "replay_input_override": replay_override,
+        }
+    )
+
+    assert len(research_agent.calls) == 1
+
+    agent_input = research_agent.calls[0]
+
+    assert (
+        agent_input.description
+        == replay_description
+    )
+
+    assert (
+        agent_input.description
+        != subtask.description
+    )
+
+    assert (
+        agent_input.context["replay"]
+        is True
+    )
+
+    assert (
+        agent_input.context["replay_override"]
+        == replay_override
+    )
+
+    assert (
+        agent_input.context["custom_context"]
+        == "replay-test"
+    )
+
+    assert (
+        agent_input.context["replay_source_span_id"]
+        == "source-span-123"
+    )
+
+    assert result["specialist_outputs"]
 @pytest.mark.asyncio
 async def test_workflow_uses_working_memory():
     task_id = uuid4()

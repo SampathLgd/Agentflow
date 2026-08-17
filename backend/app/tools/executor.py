@@ -1,7 +1,12 @@
-from typing import Any
-from uuid import UUID
 from datetime import datetime, timezone
 import time
+from typing import Any
+from uuid import UUID
+
+from app.observability.tracing import (
+    annotate_current_span,
+    current_trace,
+)
 from app.schemas.execution import Specialist
 from app.schemas.tool_invocation import ToolInvocation
 from app.tools.rate_limiter import (
@@ -26,6 +31,7 @@ class ToolExecutor:
     - execute the tool
     - validate outputs
     - capture invocation/audit information
+    - emit Phase 4 observability spans
     """
 
     def __init__(
@@ -73,79 +79,111 @@ class ToolExecutor:
             arguments=arguments,
             success=False,
         )
+
         started = time.perf_counter()
 
         self.invocations.append(
             invocation
         )
 
-        try:
-            # -------------------------------------------------
-            # Authorization
-            # -------------------------------------------------
+        with current_trace(
+            name=f"tool.{tool_name}",
+            kind="tool",
+            execution_id=None,
+            specialist=specialist.value,
+            subtask_id=subtask_id,
+            tool_name=tool_name,
+        ) as span:
 
-            if not definition.is_allowed(
-                specialist
-            ):
-                raise PermissionError(
-                    f"Specialist '{specialist.value}' "
-                    f"is not allowed to use tool "
-                    f"'{tool_name}'."
+            if span is not None:
+                annotate_current_span(
+                    input_value=arguments,
                 )
 
-            # -------------------------------------------------
-            # Rate limit
-            # -------------------------------------------------
+            try:
+                # -------------------------------------------------
+                # Authorization
+                # -------------------------------------------------
 
-            self.rate_limiter.check(
-                tool_name=tool_name,
-                specialist=specialist.value,
-                limit_per_minute=(
-                    definition.rate_limit_per_minute
-                ),
-            )
+                if not definition.is_allowed(
+                    specialist
+                ):
+                    raise PermissionError(
+                        f"Specialist "
+                        f"'{specialist.value}' "
+                        f"is not allowed to use "
+                        f"tool '{tool_name}'."
+                    )
 
-            # -------------------------------------------------
-            # Input validation
-            # -------------------------------------------------
+                # -------------------------------------------------
+                # Rate limit
+                # -------------------------------------------------
 
-            validate_tool_input(
-                definition.input_schema,
-                arguments,
-            )
+                self.rate_limiter.check(
+                    tool_name=tool_name,
+                    specialist=specialist.value,
+                    limit_per_minute=(
+                        definition.rate_limit_per_minute
+                    ),
+                )
 
-            # -------------------------------------------------
-            # Tool execution
-            # -------------------------------------------------
+                # -------------------------------------------------
+                # Input validation
+                # -------------------------------------------------
 
-            result = await tool.execute(
-                arguments
-            )
+                validate_tool_input(
+                    definition.input_schema,
+                    arguments,
+                )
 
-            # -------------------------------------------------
-            # Output validation
-            # -------------------------------------------------
+                # -------------------------------------------------
+                # Tool execution
+                # -------------------------------------------------
 
-            validate_tool_output(
-                definition.output_schema,
-                result,
-            )
+                result = await tool.execute(
+                    arguments
+                )
 
-            invocation.success = True
-            invocation.result = result
+                # -------------------------------------------------
+                # Output validation
+                # -------------------------------------------------
 
-            return result
+                validate_tool_output(
+                    definition.output_schema,
+                    result,
+                )
 
-        except Exception as exc:
-            invocation.success = False
-            invocation.error = str(exc)
+                invocation.success = True
+                invocation.result = result
 
-            raise
-        finally:
-            invocation.completed_at = datetime.now(
-                timezone.utc
-            )
+                if span is not None:
+                    span.finish(
+                        status="success",
+                        output=result,
+                    )
 
-            invocation.latency_ms = (
-                time.perf_counter() - started
-            ) * 1000
+                return result
+
+            except Exception as exc:
+                invocation.success = False
+                invocation.error = str(exc)
+
+                if span is not None:
+                    span.finish(
+                        status="failure",
+                        error=exc,
+                    )
+
+                raise
+
+            finally:
+                invocation.completed_at = (
+                    datetime.now(
+                        timezone.utc
+                    )
+                )
+
+                invocation.latency_ms = (
+                    time.perf_counter()
+                    - started
+                ) * 1000

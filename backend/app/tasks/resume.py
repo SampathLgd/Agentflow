@@ -9,11 +9,113 @@ from app.db.repositories.execution import ExecutionRepository
 from app.db.repositories.human_decision import (
     HumanDecisionRepository,
 )
+from app.db.repositories.subtask import (
+    SubTaskRepository,
+)
 from app.db.session import AsyncSessionLocal
 from app.graph.workflow import build_workflow
+from app.observability.repository import TraceRepository
+from app.observability.tracing import (
+    ExecutionTrace,
+    current_trace,
+    start_trace,
+    use_trace,
+)
 from app.runtime.dependencies import build_agent_runtime
 from app.schemas.execution import ExecutionPlan
 from app.schemas.review import ReviewResult
+
+
+async def _persist_trace(
+    *,
+    session,
+    trace: ExecutionTrace,
+    status: str,
+) -> bool:
+    """
+    Persist an execution trace without allowing observability
+    failures to break the primary AgentFlow execution.
+    """
+
+    trace.finish(status)
+
+    try:
+        async with session.begin_nested():
+            trace_repo = TraceRepository(session)
+
+            await trace_repo.save(trace)
+
+        return True
+
+    except Exception:
+        return False
+
+
+async def _load_execution_plan(
+    *,
+    memory,
+    subtask_repo: SubTaskRepository,
+    task_id: UUID,
+    execution_id: UUID,
+) -> ExecutionPlan | None:
+    """
+    Restore the execution plan.
+
+    Primary source:
+        Redis working memory
+
+    Durable fallback:
+        PostgreSQL subtasks
+
+    When PostgreSQL is used as the fallback, the reconstructed
+    plan is written back into Redis so subsequent resume/workflow
+    operations can continue normally.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Try Redis
+    # ---------------------------------------------------------
+
+    snapshot = await memory.snapshot(
+        str(task_id)
+    )
+
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    plan_data = snapshot.get(
+        "plan"
+    )
+
+    if plan_data:
+        return ExecutionPlan.model_validate(
+            plan_data
+        )
+
+    # ---------------------------------------------------------
+    # 2. Redis has no plan -> PostgreSQL fallback
+    # ---------------------------------------------------------
+
+    plan = await subtask_repo.get_execution_plan(
+        execution_id=execution_id,
+        task_id=task_id,
+    )
+
+    if plan is None:
+        return None
+
+    # ---------------------------------------------------------
+    # 3. Restore Redis from durable PostgreSQL state
+    # ---------------------------------------------------------
+
+    await memory.set_plan(
+        str(task_id),
+        plan.model_dump(
+            mode="json"
+        ),
+    )
+
+    return plan
 
 
 async def _resume_agentflow_execution(
@@ -24,31 +126,20 @@ async def _resume_agentflow_execution(
     """
     Resume an escalated AgentFlow execution after a human decision.
 
-    Supported decisions:
+    Durable state strategy:
 
-        approve
-            Continue the existing execution.
+        Redis working memory
+                ↓
+        if unavailable
+                ↓
+        PostgreSQL execution/subtasks
+                ↓
+        reconstruct workflow state
+                ↓
+        resume workflow
 
-        replan
-            Create a new plan using human feedback.
-
-        reject
-            Permanently reject the execution.
-
-        notify
-            Continue execution after notifying the reviewer.
-
-        approve_action
-            Approve the proposed action and continue.
-
-        approve_plan
-            Approve the proposed plan and continue.
-
-        take_over
-            Transfer execution to human control.
-
-    Redis working memory is used to reconstruct the graph state
-    that existed when the workflow reached the HITL boundary.
+    The existing execution trace is restored from PostgreSQL and
+    resume spans are appended to the same trace.
     """
 
     execution_uuid = UUID(execution_id)
@@ -57,8 +148,22 @@ async def _resume_agentflow_execution(
     settings = get_settings()
 
     async with AsyncSessionLocal() as session:
-        execution_repo = ExecutionRepository(session)
-        decision_repo = HumanDecisionRepository(session)
+
+        execution_repo = ExecutionRepository(
+            session
+        )
+
+        decision_repo = HumanDecisionRepository(
+            session
+        )
+
+        subtask_repo = SubTaskRepository(
+            session
+        )
+
+        trace_repo = TraceRepository(
+            session
+        )
 
         # =====================================================
         # 1. Load execution
@@ -73,12 +178,9 @@ async def _resume_agentflow_execution(
                 "Execution was not found."
             )
 
-        # -----------------------------------------------------
-        # Idempotency
-        #
-        # Celery can deliver a task more than once. Never
-        # execute an already-terminal execution again.
-        # -----------------------------------------------------
+        # =====================================================
+        # 2. Idempotency / terminal states
+        # =====================================================
 
         if execution.status == "completed":
             return {
@@ -100,12 +202,14 @@ async def _resume_agentflow_execution(
                 ),
             }
 
-        # -----------------------------------------------------
-        # Only an escalated/resuming execution can be resumed.
-        # A HITL resume can fail after the human decision has
-        # already been persisted. The retry-resume endpoint
-        # intentionally allows failed state.
-        # -----------------------------------------------------
+        if execution.status == "human_takeover":
+            return {
+                "task_id": str(execution.task_id),
+                "execution_id": str(execution.id),
+                "status": "human_takeover",
+                "final_output": None,
+                "error": None,
+            }
 
         if execution.status not in {
             "escalated",
@@ -117,7 +221,7 @@ async def _resume_agentflow_execution(
             )
 
         # =====================================================
-        # 2. Load decision
+        # 3. Load human decision
         # =====================================================
 
         decision = await decision_repo.get(
@@ -140,7 +244,7 @@ async def _resume_agentflow_execution(
                 "Human decision has not been decided."
             )
 
-        ALLOWED_HUMAN_DECISIONS = {
+        allowed_decisions = {
             "approve",
             "replan",
             "reject",
@@ -150,21 +254,138 @@ async def _resume_agentflow_execution(
             "take_over",
         }
 
-        if decision.decision not in ALLOWED_HUMAN_DECISIONS:
+        if decision.decision not in allowed_decisions:
             raise ValueError(
                 "Unsupported human decision."
             )
 
-        # -----------------------------------------------------
-        # Move execution explicitly into resuming state.
-        # -----------------------------------------------------
+        # =====================================================
+        # 4. Terminal decisions
+        # =====================================================
+
+        if decision.decision == "reject":
+
+            await execution_repo.update_status(
+                execution.id,
+                "rejected",
+            )
+
+            execution.human_decision_status = (
+                "completed"
+            )
+            execution.human_escalation_required = False
+            execution.escalation_required = False
+            execution.human_decision = (
+                decision.decision
+            )
+            execution.human_feedback = (
+                decision.feedback
+            )
+
+            await session.commit()
+
+            return {
+                "task_id": str(execution.task.id),
+                "execution_id": str(execution.id),
+                "status": "rejected",
+                "final_output": None,
+                "error": (
+                    "Execution was rejected by "
+                    "the human reviewer."
+                ),
+            }
+
+        if decision.decision == "take_over":
+
+            await execution_repo.update_status(
+                execution.id,
+                "human_takeover",
+            )
+
+            execution.human_decision_status = (
+                "completed"
+            )
+            execution.human_escalation_required = False
+            execution.escalation_required = False
+            execution.human_decision = (
+                decision.decision
+            )
+            execution.human_feedback = (
+                decision.feedback
+                or (
+                    "Execution was transferred "
+                    "to human control."
+                )
+            )
+
+            await session.commit()
+
+            return {
+                "task_id": str(execution.task.id),
+                "execution_id": str(execution.id),
+                "status": "human_takeover",
+                "final_output": None,
+                "error": None,
+            }
+
+        # =====================================================
+        # 5. Restore durable trace
+        # =====================================================
+
+        trace = await trace_repo.load_execution_trace(
+            execution.id
+        )
+
+        if trace is None:
+            trace = start_trace(
+                execution_id=execution.id,
+                task_id=execution.task_id,
+                user_id=(
+                    str(execution.task.user_id)
+                    if execution.task is not None
+                    and execution.task.user_id is not None
+                    else None
+                ),
+            )
+
+        trace.status = "running"
+        trace.completed_at = None
+
+        # =====================================================
+        # 6. Human decision trace span
+        # =====================================================
+
+        with use_trace(trace):
+
+            with current_trace(
+                name="human_decision",
+                kind="human_decision",
+                execution_id=execution.id,
+                decision=decision.decision,
+                decision_id=str(decision.id),
+                approval_level=(
+                    decision.approval_level
+                ),
+                escalation_trigger=(
+                    decision.escalation_trigger
+                ),
+                feedback=(
+                    decision.feedback
+                    or ""
+                ),
+            ):
+                pass
+
+        # =====================================================
+        # 7. Move execution into resuming state
+        # =====================================================
 
         if execution.status != "resuming":
             execution.status = "resuming"
             await session.flush()
 
         # =====================================================
-        # 3. Load task
+        # 8. Load task
         # =====================================================
 
         task = execution.task
@@ -175,67 +396,7 @@ async def _resume_agentflow_execution(
             )
 
         # =====================================================
-        # 4. Reject
-        # =====================================================
-
-        if decision.decision == "reject":
-            await execution_repo.update_status(
-                execution.id,
-                "rejected",
-            )
-
-            execution.human_decision_status = (
-                "completed"
-            )
-
-            execution.human_escalation_required = False
-            execution.escalation_required = False
-
-            await session.commit()
-
-            return {
-                "task_id": str(task.id),
-                "execution_id": str(execution.id),
-                "status": "rejected",
-                "final_output": None,
-                "error": (
-                    "Execution was rejected by "
-                    "the human reviewer."
-                ),
-            }
-
-        # =====================================================
-        # 5. Human takeover
-        # =====================================================
-
-        if decision.decision == "take_over":
-            await execution_repo.update_status(
-                execution.id,
-                "human_takeover",
-            )
-
-            execution.human_decision_status = "completed"
-
-            execution.human_escalation_required = False
-            execution.escalation_required = False
-
-            execution.human_feedback = (
-                decision.feedback
-                or "Execution was transferred to human control."
-            )
-
-            await session.commit()
-
-            return {
-                "task_id": str(task.id),
-                "execution_id": str(execution.id),
-                "status": "human_takeover",
-                "final_output": None,
-                "error": None,
-            }
-
-        # =====================================================
-        # 6. Build runtime
+        # 9. Build runtime
         # =====================================================
 
         runtime = await build_agent_runtime(
@@ -254,65 +415,46 @@ async def _resume_agentflow_execution(
             memory_service=runtime.memory_service,
         )
 
-        # =====================================================
-        # 7. Restore Redis working-memory snapshot
-        # =====================================================
-
         memory = runtime.working_memory
+
+        # =====================================================
+        # 10. Restore Redis snapshot
+        # =====================================================
 
         snapshot = await memory.snapshot(
             str(task.id)
         )
 
         if not isinstance(snapshot, dict):
-            raise ValueError(
-                "Working-memory snapshot is invalid."
-            )
+            snapshot = {}
 
-        # -----------------------------------------------------
-        # Plan
-        # -----------------------------------------------------
-
-        plan_data = snapshot.get(
-            "plan"
-        )
-
-        resume_node = (
-            execution.resume_node
-            or ""
-        ).strip().lower()
-
-        # -----------------------------------------------------
-        # A plan is not required when:
+        # =====================================================
+        # 11. Restore execution plan
         #
-        #   1. escalation happened before planning
-        #   2. human selected replan
-        #
-        # In both cases the workflow can construct a fresh plan.
-        # -----------------------------------------------------
-
-        plan_required = (
-            decision.decision != "replan"
-            and resume_node != "planning"
-        )
-
-        if plan_required and not plan_data:
-            raise ValueError(
-                "Cannot resume execution because "
-                "the execution plan was not found "
-                "in working memory."
-            )
+        # Redis -> PostgreSQL fallback
+        # =====================================================
 
         plan = None
 
-        if plan_data:
-            plan = ExecutionPlan.model_validate(
-                plan_data
+        if decision.decision != "replan":
+
+            plan = await _load_execution_plan(
+                memory=memory,
+                subtask_repo=subtask_repo,
+                task_id=task.id,
+                execution_id=execution.id,
             )
 
-        # -----------------------------------------------------
-        # Specialist outputs
-        # -----------------------------------------------------
+            if plan is None:
+                raise ValueError(
+                    "Cannot resume execution because "
+                    "the execution plan could not be restored "
+                    "from Redis or PostgreSQL."
+                )
+
+        # =====================================================
+        # 12. Restore specialist outputs
+        # =====================================================
 
         specialist_outputs = snapshot.get(
             "subtask_outputs",
@@ -333,13 +475,10 @@ async def _resume_agentflow_execution(
 
         specialist_outputs = valid_outputs
 
-        # -----------------------------------------------------
-        # Completed subtasks
-        # -----------------------------------------------------
-
         completed_subtasks: list[str] = []
 
         for output in specialist_outputs:
+
             subtask_id = output.get(
                 "subtask_id"
             )
@@ -356,7 +495,7 @@ async def _resume_agentflow_execution(
         )
 
         # =====================================================
-        # 8. Restore intermediate results
+        # 13. Restore intermediate results
         # =====================================================
 
         intermediate_results = snapshot.get(
@@ -376,24 +515,22 @@ async def _resume_agentflow_execution(
 
         review = None
 
-        if (
-            review_data is not None
-            and isinstance(
-                review_data,
-                dict,
-            )
+        if isinstance(
+            review_data,
+            dict,
         ):
             review = ReviewResult.model_validate(
                 review_data
             )
 
         # =====================================================
-        # 9. Restore long-term memory
+        # 14. Restore long-term memory
         # =====================================================
 
         long_term_memories: list[dict] = []
 
         if task.user_id:
+
             memory_results = (
                 await runtime.long_term_memory.search(
                     user_id=str(task.user_id),
@@ -413,7 +550,7 @@ async def _resume_agentflow_execution(
             ]
 
         # =====================================================
-        # 10. Determine confidence threshold
+        # 15. Confidence threshold
         # =====================================================
 
         confidence_threshold = (
@@ -424,11 +561,20 @@ async def _resume_agentflow_execution(
             confidence_threshold = 0.5
 
         # =====================================================
-        # 11. Build restored graph state
+        # 16. Build restored graph state
         # =====================================================
 
         state: dict = {
+
+            # -------------------------------------------------
+            # Identity
+            # -------------------------------------------------
+
             "task_id": str(task.id),
+
+            "execution_id": str(
+                execution.id
+            ),
 
             "user_id": (
                 str(task.user_id)
@@ -438,9 +584,17 @@ async def _resume_agentflow_execution(
 
             "description": task.description,
 
+            # -------------------------------------------------
+            # Planning
+            # -------------------------------------------------
+
             "plan": plan,
 
             "ready_subtasks": [],
+
+            # -------------------------------------------------
+            # Specialist state
+            # -------------------------------------------------
 
             "completed_subtasks": (
                 completed_subtasks
@@ -450,9 +604,17 @@ async def _resume_agentflow_execution(
                 specialist_outputs
             ),
 
+            # -------------------------------------------------
+            # Memory
+            # -------------------------------------------------
+
             "long_term_memories": (
                 long_term_memories
             ),
+
+            # -------------------------------------------------
+            # Retry
+            # -------------------------------------------------
 
             "retry_count": 0,
 
@@ -462,6 +624,10 @@ async def _resume_agentflow_execution(
 
             "retry_feedback": "",
 
+            # -------------------------------------------------
+            # Review
+            # -------------------------------------------------
+
             "review_retry_count": 0,
 
             "max_review_retries": 2,
@@ -469,6 +635,10 @@ async def _resume_agentflow_execution(
             "review_feedback": (
                 decision.feedback or ""
             ),
+
+            # -------------------------------------------------
+            # Confidence
+            # -------------------------------------------------
 
             "specialist_confidence": (
                 1.0
@@ -485,6 +655,10 @@ async def _resume_agentflow_execution(
                 confidence_threshold
             ),
 
+            # -------------------------------------------------
+            # Escalation
+            # -------------------------------------------------
+
             "human_escalation_required": False,
 
             "escalation_required": False,
@@ -497,6 +671,10 @@ async def _resume_agentflow_execution(
             "replan_required": (
                 decision.decision == "replan"
             ),
+
+            # -------------------------------------------------
+            # HITL
+            # -------------------------------------------------
 
             "resume_node": (
                 execution.resume_node
@@ -525,6 +703,10 @@ async def _resume_agentflow_execution(
 
             "resume_from_human": True,
 
+            # -------------------------------------------------
+            # Final state
+            # -------------------------------------------------
+
             "execution_status": "running",
 
             "error": "",
@@ -533,13 +715,12 @@ async def _resume_agentflow_execution(
         if review is not None:
             state["review"] = review
 
-        # -----------------------------------------------------
-        # Replan starts a fresh planning/specialist cycle.
-        # Do not carry the previous low-confidence escalation
-        # into the new plan.
-        # -----------------------------------------------------
+        # =====================================================
+        # 17. Replan handling
+        # =====================================================
 
         if decision.decision == "replan":
+
             execution.specialist_confidence = None
             execution.escalation_required = False
             execution.human_escalation_required = False
@@ -547,15 +728,46 @@ async def _resume_agentflow_execution(
             await session.flush()
 
         # =====================================================
-        # 12. Resume workflow
+        # 18. Resume workflow
         # =====================================================
 
         try:
-            result = await workflow.ainvoke(
-                state
-            )
 
-            if not isinstance(result, dict):
+            with use_trace(trace):
+
+                with current_trace(
+                    name="execution.resume",
+                    kind="workflow",
+                    execution_id=str(
+                        execution.id
+                    ),
+                    task_id=str(
+                        task.id
+                    ),
+                    resume_node=(
+                        execution.resume_node
+                        or "post_specialist"
+                    ),
+                    resume_subtask_id=(
+                        str(
+                            execution.resume_subtask_id
+                        )
+                        if execution.resume_subtask_id
+                        else None
+                    ),
+                    human_decision=(
+                        decision.decision
+                    ),
+                ):
+
+                    result = await workflow.ainvoke(
+                        state
+                    )
+
+            if not isinstance(
+                result,
+                dict,
+            ):
                 raise ValueError(
                     "Workflow returned an invalid result."
                 )
@@ -565,17 +777,13 @@ async def _resume_agentflow_execution(
                 "completed",
             )
 
-            # -------------------------------------------------
-            # Persist current workflow status first.
-            # -------------------------------------------------
-
             await execution_repo.update_status(
                 execution.id,
                 final_status,
             )
 
             # =================================================
-            # 13. New HITL boundary
+            # 19. New HITL boundary
             # =================================================
 
             if final_status == "escalated":
@@ -660,25 +868,12 @@ async def _resume_agentflow_execution(
                     or "Continue execution."
                 )
 
-                # -------------------------------------------------
-                # IMPORTANT:
-                #
-                # A resumed workflow may not return review_context.
-                #
-                # The first escalation usually has it, but a second
-                # escalation after approve/replan may only return the
-                # workflow state.
-                #
-                # The reviewer API requires a complete context, so
-                # reconstruct it here.
-                # -------------------------------------------------
-
                 review_context = result.get(
                     "review_context"
                 )
 
-                # Convert a Pydantic/model context if one was returned.
                 if review_context is not None:
+
                     if hasattr(
                         review_context,
                         "model_dump",
@@ -688,16 +883,12 @@ async def _resume_agentflow_execution(
                                 mode="json"
                             )
                         )
+
                     elif not isinstance(
                         review_context,
                         dict,
                     ):
                         review_context = None
-
-                # -------------------------------------------------
-                # Prefer explicit values from the workflow result.
-                # Fall back to restored state/snapshot.
-                # -------------------------------------------------
 
                 result_plan = result.get(
                     "plan"
@@ -793,51 +984,32 @@ async def _resume_agentflow_execution(
                 if result_past_decisions is None:
                     result_past_decisions = []
 
-                # -------------------------------------------------
-                # If the workflow did not provide review_context,
-                # construct the exact packet expected by the
-                # reviewer API/UI.
-                # -------------------------------------------------
-
                 if review_context is None:
+
                     review_context = {
                         "original_task": (
                             task.description
                         ),
-
-                        "plan": (
-                            result_plan
-                        ),
-
+                        "plan": result_plan,
                         "completed_steps": (
                             result_completed_steps
                         ),
-
                         "current_step": (
                             result_current_step
                         ),
-
                         "proposed_action": (
                             proposed_action
                         ),
-
                         "reasoning": (
                             result_reasoning
                         ),
-
                         "relevant_memories": (
                             result_memories
                         ),
-
                         "past_decisions": (
                             result_past_decisions
                         ),
                     }
-
-                # -------------------------------------------------
-                # Guarantee the two required reviewer fields are
-                # always populated.
-                # -------------------------------------------------
 
                 if not review_context.get(
                     "original_task"
@@ -883,10 +1055,6 @@ async def _resume_agentflow_execution(
                         "past_decisions"
                     ] = result_past_decisions
 
-                # -------------------------------------------------
-                # Persist NEW escalation metadata.
-                # -------------------------------------------------
-
                 execution.escalation_required = (
                     escalation_required
                 )
@@ -915,20 +1083,12 @@ async def _resume_agentflow_execution(
                     new_resume_subtask_id
                 )
 
-                # -------------------------------------------------
-                # The previous human decision remains decided.
-                # Create a NEW pending decision for the NEW
-                # HITL boundary.
-                # -------------------------------------------------
-
                 execution.human_decision_status = (
                     "pending"
                 )
 
                 execution.human_decision = None
-
                 execution.human_feedback = None
-
                 execution.human_decided_at = None
 
                 await decision_repo.create_pending(
@@ -945,9 +1105,16 @@ async def _resume_agentflow_execution(
                     ),
                 )
 
+                await _persist_trace(
+                    session=session,
+                    trace=trace,
+                    status="escalated",
+                )
+
             else:
+
                 # =================================================
-                # 14. Terminal/non-HITL state
+                # 20. Terminal/non-HITL state
                 # =================================================
 
                 execution.human_decision_status = (
@@ -969,6 +1136,12 @@ async def _resume_agentflow_execution(
                         )
                     )
 
+                await _persist_trace(
+                    session=session,
+                    trace=trace,
+                    status=final_status,
+                )
+
             await session.commit()
 
             return {
@@ -984,7 +1157,24 @@ async def _resume_agentflow_execution(
             }
 
         except Exception:
+
             await session.rollback()
+
+            try:
+                trace.status = "failed"
+                trace.completed_at = None
+
+                await _persist_trace(
+                    session=session,
+                    trace=trace,
+                    status="failed",
+                )
+
+                await session.commit()
+
+            except Exception:
+                await session.rollback()
+
             raise
 
 

@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 
+import TraceExplorer from "./components/trace/TraceExplorer";
+
 import {
   getEscalation,
   getReview,
@@ -90,6 +92,11 @@ function isReviewContextUnavailable(
 }
 
 function App() {
+  const [activeView, setActiveView] =
+    useState<"reviewer" | "trace">(
+      "reviewer",
+    );
+
   const [queue, setQueue] = useState<
     ReviewQueueItem[]
   >([]);
@@ -177,6 +184,7 @@ function App() {
       }
     } catch (err) {
       console.error(err);
+
       setError(
         "Failed to load the review queue.",
       );
@@ -249,29 +257,38 @@ function App() {
     if (!decisionState) {
       return;
     }
-  
-    const executionId = decisionState.executionId;
-  
+
+    const executionId =
+      decisionState.executionId;
+
     if (!executionId) {
       return;
     }
-  
+
     let cancelled = false;
-  
+
     async function pollExecution() {
       try {
-        const state = await getEscalation(executionId);
-  
+        const state =
+          await getEscalation(
+            executionId,
+          );
+
         if (cancelled) {
           return;
         }
-  
-        setExecutionStatus(state.status);
-  
+
+        setExecutionStatus(
+          state.status,
+        );
+
         if (
-          state.status === "completed" ||
-          state.status === "rejected" ||
-          state.status === "human_takeover" ||
+          state.status ===
+            "completed" ||
+          state.status ===
+            "rejected" ||
+          state.status ===
+            "human_takeover" ||
           state.status === "failed"
         ) {
           return;
@@ -283,16 +300,17 @@ function App() {
         );
       }
     }
-  
+
     void pollExecution();
-  
-    const interval = window.setInterval(
-      () => {
-        void pollExecution();
-      },
-      2000,
-    );
-  
+
+    const interval =
+      window.setInterval(
+        () => {
+          void pollExecution();
+        },
+        2000,
+      );
+
     return () => {
       cancelled = true;
       window.clearInterval(interval);
@@ -310,18 +328,22 @@ function App() {
       setSubmitting(true);
       setError(null);
 
-      const response = await submitHumanDecision(
-        review.execution_id,
-        decision,
-        feedback,
-        decidedBy,
-      );
+      const response =
+        await submitHumanDecision(
+          review.execution_id,
+          decision,
+          feedback,
+          decidedBy,
+        );
 
       setDecisionState({
-        executionId: response.execution_id,
+        executionId:
+          response.execution_id,
         decisionId: response.id,
         decision,
-        resumeTaskId: response.resume_task_id ?? null,
+        resumeTaskId:
+          response.resume_task_id ??
+          null,
       });
 
       setExecutionStatus("resuming");
@@ -358,6 +380,7 @@ function App() {
       );
 
       setExecutionStatus("resuming");
+
       setDecisionState({
         ...decisionState,
       });
@@ -396,24 +419,63 @@ function App() {
     <div className="app">
       <header className="topbar">
         <div>
-          <h1>AgentFlow Reviewer</h1>
+          <h1>
+            AgentFlow Reviewer
+          </h1>
 
           <p>
-            Human-in-the-loop approval queue
+            {activeView === "reviewer"
+              ? "Human-in-the-loop approval queue"
+              : "Execution observability and trace explorer"}
           </p>
         </div>
 
-        <button
-          className="refresh-button"
-          onClick={() =>
-            void loadQueue()
-          }
-          disabled={loadingQueue}
-        >
-          {loadingQueue
-            ? "Refreshing..."
-            : "Refresh Queue"}
-        </button>
+        <div className="view-switcher">
+          <button
+            type="button"
+            className={
+              activeView === "reviewer"
+                ? "view-button active"
+                : "view-button"
+            }
+            onClick={() =>
+              setActiveView(
+                "reviewer",
+              )
+            }
+          >
+            Reviewer
+          </button>
+
+          <button
+            type="button"
+            className={
+              activeView === "trace"
+                ? "view-button active"
+                : "view-button"
+            }
+            onClick={() =>
+              setActiveView("trace")
+            }
+          >
+            Trace Explorer
+          </button>
+
+          {activeView === "reviewer" && (
+            <button
+              type="button"
+              className="refresh-button"
+              onClick={() =>
+                void loadQueue()
+              }
+              disabled={loadingQueue}
+            >
+              {loadingQueue
+                ? "Refreshing..."
+                : "Refresh Queue"}
+            </button>
+          )}
+        </div>
       </header>
 
       {error && (
@@ -422,152 +484,180 @@ function App() {
         </div>
       )}
 
-      {decisionState && (
-        <DecisionSubmittedPanel
-          decisionState={decisionState}
-          executionStatus={executionStatus}
-          resuming={resuming}
-          onRetryResume={handleResume}
-          onDismiss={() => {
-            setDecisionState(null);
-            setExecutionStatus(null);
-          }}
-        />
+      {decisionState &&
+        activeView === "reviewer" && (
+          <DecisionSubmittedPanel
+            decisionState={decisionState}
+            executionStatus={
+              executionStatus
+            }
+            resuming={resuming}
+            onRetryResume={
+              handleResume
+            }
+            onDismiss={() => {
+              setDecisionState(null);
+              setExecutionStatus(null);
+            }}
+          />
+        )}
+
+      {activeView === "reviewer" ? (
+        <main className="workspace">
+          <aside className="queue-panel">
+            <div className="panel-header">
+              <h2>
+                Review Queue
+              </h2>
+
+              <span className="queue-count">
+                {queue.length}
+              </span>
+            </div>
+
+            {loadingQueue ? (
+              <div className="empty-state">
+                Loading queue...
+              </div>
+            ) : queue.length === 0 ? (
+              <div className="empty-state">
+                No pending human reviews.
+              </div>
+            ) : (
+              <div className="queue-list">
+                {queue.map(
+                  (item) => (
+                    <button
+                      type="button"
+                      key={
+                        item.execution_id
+                      }
+                      className={`queue-item ${
+                        selectedExecutionId ===
+                        item.execution_id
+                          ? "selected"
+                          : ""
+                      }`}
+                      onClick={() =>
+                        handleSelectExecution(
+                          item.execution_id,
+                        )
+                      }
+                    >
+                      <div className="queue-item-top">
+                        <strong>
+                          {item.approval_level ??
+                            "Human review"}
+                        </strong>
+
+                        <span>
+                          {item.status ??
+                            "pending"}
+                        </span>
+                      </div>
+
+                      <div className="queue-execution">
+                        {
+                          item.execution_id
+                        }
+                      </div>
+
+                      {item.escalation_trigger && (
+                        <div className="queue-trigger">
+                          {
+                            item.escalation_trigger
+                          }
+                        </div>
+                      )}
+
+                      {item.proposed_action && (
+                        <p>
+                          {
+                            item.proposed_action
+                          }
+                        </p>
+                      )}
+                    </button>
+                  ),
+                )}
+              </div>
+            )}
+          </aside>
+
+          <section className="review-panel">
+            {!selectedExecutionId ? (
+              <div className="review-placeholder">
+                <h2>
+                  Select a review
+                </h2>
+
+                <p>
+                  Choose a pending
+                  execution from the
+                  queue.
+                </p>
+              </div>
+            ) : loadingReview ? (
+              <div className="review-placeholder">
+                <h2>
+                  Loading review...
+                </h2>
+              </div>
+            ) : reviewUnavailable ? (
+              <ReviewUnavailable
+                executionId={
+                  selectedExecutionId
+                }
+                message={
+                  reviewUnavailableMessage
+                }
+                onRefresh={() =>
+                  void loadReview(
+                    selectedExecutionId,
+                  )
+                }
+              />
+            ) : !review ? (
+              <div className="review-placeholder">
+                <h2>
+                  Review unavailable
+                </h2>
+
+                <p>
+                  The review packet
+                  could not be loaded.
+                </p>
+              </div>
+            ) : (
+              <ReviewPanel
+                review={review}
+                feedback={feedback}
+                setFeedback={
+                  setFeedback
+                }
+                decidedBy={decidedBy}
+                setDecidedBy={
+                  setDecidedBy
+                }
+                submitting={
+                  submitting
+                }
+                onDecision={
+                  handleDecision
+                }
+              />
+            )}
+          </section>
+        </main>
+      ) : (
+        <main className="trace-page">
+          <TraceExplorer
+            initialExecutionId={
+              selectedExecutionId
+            }
+          />
+        </main>
       )}
-
-      <main className="workspace">
-        <aside className="queue-panel">
-          <div className="panel-header">
-            <h2>Review Queue</h2>
-
-            <span className="queue-count">
-              {queue.length}
-            </span>
-          </div>
-
-          {loadingQueue ? (
-            <div className="empty-state">
-              Loading queue...
-            </div>
-          ) : queue.length === 0 ? (
-            <div className="empty-state">
-              No pending human reviews.
-            </div>
-          ) : (
-            <div className="queue-list">
-              {queue.map((item) => (
-                <button
-                  key={
-                    item.execution_id
-                  }
-                  className={`queue-item ${
-                    selectedExecutionId ===
-                    item.execution_id
-                      ? "selected"
-                      : ""
-                  }`}
-                  onClick={() =>
-                    handleSelectExecution(
-                      item.execution_id,
-                    )
-                  }
-                >
-                  <div className="queue-item-top">
-                    <strong>
-                      {item.approval_level ??
-                        "Human review"}
-                    </strong>
-
-                    <span>
-                      {item.status ??
-                        "pending"}
-                    </span>
-                  </div>
-
-                  <div className="queue-execution">
-                    {item.execution_id}
-                  </div>
-
-                  {item.escalation_trigger && (
-                    <div className="queue-trigger">
-                      {
-                        item.escalation_trigger
-                      }
-                    </div>
-                  )}
-
-                  {item.proposed_action && (
-                    <p>
-                      {
-                        item.proposed_action
-                      }
-                    </p>
-                  )}
-
-                </button>
-              ))}
-            </div>
-          )}
-        </aside>
-
-        <section className="review-panel">
-          {!selectedExecutionId ? (
-            <div className="review-placeholder">
-              <h2>
-                Select a review
-              </h2>
-
-              <p>
-                Choose a pending execution
-                from the queue.
-              </p>
-            </div>
-          ) : loadingReview ? (
-            <div className="review-placeholder">
-              <h2>
-                Loading review...
-              </h2>
-            </div>
-          ) : reviewUnavailable ? (
-            <ReviewUnavailable
-              executionId={
-                selectedExecutionId
-              }
-              message={
-                reviewUnavailableMessage
-              }
-              onRefresh={() =>
-                void loadReview(
-                  selectedExecutionId,
-                )
-              }
-            />
-          ) : !review ? (
-            <div className="review-placeholder">
-              <h2>
-                Review unavailable
-              </h2>
-
-              <p>
-                The review packet could not
-                be loaded.
-              </p>
-            </div>
-          ) : (
-            <ReviewPanel
-              review={review}
-              feedback={feedback}
-              setFeedback={setFeedback}
-              decidedBy={decidedBy}
-              setDecidedBy={setDecidedBy}
-              submitting={submitting}
-              onDecision={
-                handleDecision
-              }
-            />
-          )}
-        </section>
-      </main>
     </div>
   );
 }
@@ -596,37 +686,74 @@ function DecisionSubmittedPanel({
     "completed",
     "rejected",
     "human_takeover",
-  ].includes(executionStatus ?? "");
+  ].includes(
+    executionStatus ?? "",
+  );
 
-  const retryable = executionStatus === "failed";
+  const retryable =
+    executionStatus === "failed";
 
   return (
     <section className="decision-submitted-panel">
       <div>
-        <div className="eyebrow">Decision submitted</div>
-        <h2>Human decision: {decisionState.decision}</h2>
+        <div className="eyebrow">
+          Decision submitted
+        </div>
+
+        <h2>
+          Human decision:{" "}
+          {decisionState.decision}
+        </h2>
+
         <p>
-          The decision was saved successfully and the resume task was queued.
+          The decision was saved successfully
+          and the resume task was queued.
         </p>
+
         <div className="metadata-grid">
-          <Metadata label="Execution" value={decisionState.executionId} />
-          <Metadata label="Status" value={executionStatus ?? "resuming"} />
-          <Metadata label="Resume task" value={decisionState.resumeTaskId ?? "—"} />
+          <Metadata
+            label="Execution"
+            value={
+              decisionState.executionId
+            }
+          />
+
+          <Metadata
+            label="Status"
+            value={
+              executionStatus ??
+              "resuming"
+            }
+          />
+
+          <Metadata
+            label="Resume task"
+            value={
+              decisionState.resumeTaskId ??
+              "—"
+            }
+          />
         </div>
       </div>
 
       {retryable && (
         <button
+          type="button"
           className="resume-button"
           disabled={resuming}
-          onClick={() => void onRetryResume()}
+          onClick={() =>
+            void onRetryResume()
+          }
         >
-          {resuming ? "Retrying..." : "Retry Resume"}
+          {resuming
+            ? "Retrying..."
+            : "Retry Resume"}
         </button>
       )}
 
       {terminal && (
         <button
+          type="button"
           className="refresh-button"
           onClick={onDismiss}
         >
@@ -667,11 +794,10 @@ function ReviewUnavailable({
         Execution
       </p>
 
-      <code>
-        {executionId}
-      </code>
+      <code>{executionId}</code>
 
       <button
+        type="button"
         className="refresh-button"
         onClick={onRefresh}
       >
@@ -908,24 +1034,26 @@ function ReviewPanel({
         </label>
 
         <div className="decision-grid">
-          {DECISIONS.map((item) => (
-            <button
-              key={item.value}
-              className={`decision-button decision-${item.value}`}
-              disabled={submitting}
-              onClick={() =>
-                void onDecision(
-                  item.value,
-                )
-              }
-            >
-              {submitting
-                ? "Submitting..."
-                : item.label}
-            </button>
-          ))}
+          {DECISIONS.map(
+            (item) => (
+              <button
+                type="button"
+                key={item.value}
+                className={`decision-button decision-${item.value}`}
+                disabled={submitting}
+                onClick={() =>
+                  void onDecision(
+                    item.value,
+                  )
+                }
+              >
+                {submitting
+                  ? "Submitting..."
+                  : item.label}
+              </button>
+            ),
+          )}
         </div>
-
       </section>
     </div>
   );

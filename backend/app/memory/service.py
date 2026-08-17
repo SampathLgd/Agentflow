@@ -10,6 +10,10 @@ from app.memory.long_term import (
     LongTermMemoryStore,
     MemorySearchResult,
 )
+from app.observability.tracing import (
+    annotate_current_span,
+    current_trace,
+)
 
 
 class MemoryService:
@@ -232,22 +236,64 @@ class MemoryService:
         """
         Retrieve memories in the structure expected by
         AgentGraphState.
+
+        Phase 4:
+        Record memory retrieval as a child span of the
+        workflow-level memory retrieval node.
         """
 
-        results = await self.retrieve(
+        with current_trace(
+            name="memory.retrieve",
+            kind="memory",
             user_id=user_id,
-            query=query,
-        )
+            retrieval_limit=self.retrieval_limit,
+        ) as span:
 
-        return [
-            {
-                "memory": result.memory.model_dump(
-                    mode="json"
-                ),
-                "distance": result.distance,
-            }
-            for result in results
-        ]
+            if span is not None:
+                annotate_current_span(
+                    input_value={
+                        "user_id": user_id,
+                        "query": query,
+                        "limit": self.retrieval_limit,
+                    },
+                )
+
+            try:
+                results = await self.retrieve(
+                    user_id=user_id,
+                    query=query,
+                )
+
+                memories = [
+                    {
+                        "memory": result.memory.model_dump(
+                            mode="json"
+                        ),
+                        "distance": result.distance,
+                    }
+                    for result in results
+                ]
+
+                if span is not None:
+                    annotate_current_span(
+                        result_count=len(memories),
+                    )
+
+                    span.finish(
+                        status="success",
+                        output=memories,
+                    )
+
+                return memories
+
+            except Exception as exc:
+                if span is not None:
+                    span.finish(
+                        status="failure",
+                        error=exc,
+                    )
+
+                raise
 
     # =========================================================
     # Persistence

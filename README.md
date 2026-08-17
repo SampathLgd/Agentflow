@@ -1,1575 +1,737 @@
-# AgentFlow
+# AgentFlow --- Multi-Agent Orchestration System
 
-> A production-oriented multi-agent orchestration platform for autonomous task execution with tool use, persistent memory, human-in-the-loop control, resilient LLM routing, and full execution observability.
+> A production-oriented multi-agent orchestration platform built with
+> LangGraph, FastAPI, Redis, PostgreSQL, ChromaDB, Celery, and Docker
+> Compose, with tool use, persistent memory, human-in-the-loop control,
+> execution tracing, analytics, and selected-span replay.
 
-[![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
-[![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-orange.svg)](https://langchain-ai.github.io/langgraph/)
-[![MCP](https://img.shields.io/badge/Tools-MCP-purple.svg)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-80%20passing-brightgreen.svg)](#testing)
+## Project Description
 
----
+AgentFlow is a multi-agent orchestration system for executing complex,
+multi-step tasks through a coordinated hierarchy of AI agents rather
+than a single LLM call.
 
-## Project Objective
+A **Supervisor Agent** converts an incoming task into a structured
+execution plan, assigns subtasks to domain-specific specialists, and
+manages dependency-aware execution. Specialists can use registered tools
+such as web search, read-only database querying, and code execution. A
+**Reviewer Agent** validates specialist outputs before synthesis.
 
-AgentFlow is being built to solve a fundamental problem with autonomous AI systems:
+The system addresses production-oriented agent problems including task
+decomposition, dependency management, tool failures, low-confidence
+results, human approval, asynchronous execution, persistent memory,
+observability, and reproducible debugging.
 
-> **How do we allow multiple AI agents to execute complex real-world tasks autonomously while retaining control, reliability, observability, recoverability, and human oversight?**
+The implementation follows the Project 15 architecture: a supervisor
+coordinating specialists with tools, persistent memory, human
+escalation, and full execution observability.
 
-The goal is not to build another single-agent chatbot.
+## Architecture
 
-The goal is to build an **agent orchestration platform** capable of taking a complex user request, decomposing it into an executable plan, assigning work to specialized agents, allowing those agents to use controlled tools, coordinating dependencies, validating the resulting work, retrying failures, escalating uncertain decisions to humans, learning from previous executions, and providing a complete record of what happened.
+``` mermaid
+flowchart TB
+    U[User / Client] --> API[FastAPI API]
 
-The intended end state is:
+    API --> TASK[Task / Execution Service]
+    API --> HITL[HITL API]
+    API --> TRACE[Trace / Replay API]
 
-```text
-                         USER TASK
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │    SUPERVISOR   │
-                    │     / PLANNER   │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ EXECUTION PLAN  │
-                    │ + DEPENDENCIES  │
-                    └────────┬────────┘
-                             │
-                ┌────────────┼────────────┐
-                │            │            │
-                ▼            ▼            ▼
-           ┌─────────┐ ┌──────────┐ ┌──────────┐
-           │ Research│ │ Analysis │ │ Writing  │
-           │  Agent  │ │  Agent   │ │  Agent   │
-           └────┬────┘ └────┬─────┘ └────┬─────┘
-                │            │            │
-                └────────────┼────────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │   TOOL LAYER    │
-                    │ Custom + MCP    │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │     REVIEWER    │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              │              │              │
-              ▼              ▼              ▼
-          SYNTHESIZE       RETRY         ESCALATE
-              │                             │
-              ▼                             ▼
-          FINAL RESULT                 HUMAN REVIEW
+    TASK --> CELERY[Celery Worker]
+    HITL --> CELERY
+    CELERY --> GRAPH[LangGraph Orchestration]
+
+    GRAPH --> MEMR[Redis Working Memory]
+    GRAPH --> MEML[ChromaDB Long-Term Memory]
+    GRAPH --> SUP[Supervisor Agent]
+
+    SUP --> PLAN[Structured Execution Plan]
+    PLAN --> DISPATCH[Dependency-Aware Dispatcher]
+
+    DISPATCH --> R[Research Specialist]
+    DISPATCH --> A[Data Analysis Specialist]
+    DISPATCH --> W[Writing Specialist]
+    DISPATCH --> C[Code Execution Specialist]
+
+    R --> TOOLS[Tool Registry / Executor]
+    A --> TOOLS
+    W --> TOOLS
+    C --> TOOLS
+
+    TOOLS --> WEB[Web Search]
+    TOOLS --> DBQ[Read-Only Database Query]
+    TOOLS --> CODE[Code Execution]
+    TOOLS --> APIX[Configured API Tools]
+
+    R --> REVIEW[Reviewer Agent]
+    A --> REVIEW
+    W --> REVIEW
+    C --> REVIEW
+
+    REVIEW -->|Approved| SYN[Synthesis]
+    REVIEW -->|Retry / Feedback| DISPATCH
+    REVIEW -->|Low Confidence| ESC[Human Escalation]
+    GRAPH -->|Low Specialist Confidence| ESC
+    GRAPH -->|Explicit User Escalation| ESC
+
+    ESC --> DECISION[Human Decision]
+    DECISION -->|Approve| RESUME[Resume Execution]
+    DECISION -->|Replan| PLAN
+    DECISION -->|Reject| END[Terminal State]
+
+    RESUME --> DISPATCH
+    RESUME --> REVIEW
+    SYN --> END
+
+    GRAPH --> TRACESTORE[(PostgreSQL Trace Store)]
+    TRACE --> TRACESTORE
+    TRACE --> REPLAY[Selected-Span Replay]
+    REPLAY --> NEWEXEC[New Replay Execution]
+    NEWEXEC --> GRAPH
+
+    POSTGRES[(PostgreSQL)] --> TASK
+    POSTGRES --> HITL
+    POSTGRES --> TRACESTORE
+
+    FRONTEND[React Frontend / Trace Explorer] --> API
+    FRONTEND --> TRACE
+
+    CELERY --> REDIS[Redis Queue / Result Backend]
 ```
 
-The architecture is based on the project's implementation guide, which defines the system as a supervisor-driven multi-agent platform with specialist tool use, persistent memory, human escalation, and observability. 
-
----
-
-# Why AgentFlow?
-
-Most AI applications stop at:
-
-```text
-User → LLM → Response
-```
-
-That architecture breaks down when the task requires:
-
-- Multiple independent capabilities
-- Long-running execution
-- Dependencies between tasks
-- External tools
-- Failure recovery
-- Validation
-- Human approval
-- Persistent memory
-- Auditability
-- Cost and latency tracking
-- Reproducible execution
-
-AgentFlow is designed around:
-
-```text
-User
- ↓
-Supervisor
- ↓
-Structured execution plan
- ↓
-Dependency-aware specialist execution
- ↓
-Tool execution
- ↓
-Review
- ↓
-Retry / Escalation / Synthesis
- ↓
-Final result
-```
-
-The system treats agents as **components in an execution system**, rather than isolated LLM calls.
-
----
-
-# Target Architecture
-
-The implementation guide defines three primary agent layers:
-
-### Supervisor
-
-Responsible for:
-
-- Receiving the user's task
-- Decomposing the task
-- Creating the execution plan
-- Assigning specialists
-- Managing dependencies
-- Coordinating execution
-
-### Specialist Agents
-
-Current specialist domains:
-
-- Research
-- Data Analysis
-- Writing
-- Code Execution
-
-Each specialist owns a domain and can access the tools appropriate for that domain.
-
-### Reviewer
-
-Responsible for:
-
-- Validating specialist outputs
-- Evaluating quality
-- Providing structured feedback
-- Rejecting incomplete work
-- Sending rejected work back for retry
-- Escalating low-confidence results
-
-This three-layer hierarchy is the foundation specified by the implementation guide. :contentReference[oaicite:1]{index=1}
-
----
-
-# Core Execution Model
-
-A task flows through the system as follows:
-
-```text
-1. Task Intake
-       │
-       ▼
-2. Supervisor Planning
-       │
-       ▼
-3. Execution Plan Validation
-       │
-       ▼
-4. Dependency Resolution
-       │
-       ▼
-5. Specialist Dispatch
-       │
-       ▼
-6. Tool Execution
-       │
-       ▼
-7. Specialist Result
-       │
-       ├── failure ──► retry
-       │
-       ├── low confidence ──► escalation
-       │
-       ▼
-8. Reviewer
-       │
-       ├── rejected ──► retry
-       │
-       ├── low confidence ──► escalation
-       │
-       ▼
-9. Synthesis
-       │
-       ▼
-10. Final Delivery
-```
-
----
-
-# Execution Plans
-
-The supervisor does not simply produce free-form instructions.
-
-It creates a structured execution plan.
-
-A plan contains:
-
-- Subtask description
-- Assigned specialist
-- Required inputs
-- Expected output
-- Estimated complexity
-- Dependencies
-
-For example:
-
-```text
-Task:
-Research a technology and prepare a report.
-
-Execution Plan:
-
-1. Research
-   specialist: research
-   dependencies: none
-
-2. Analyze findings
-   specialist: data_analysis
-   dependencies:
-      - research
-
-3. Prepare report
-   specialist: writing
-   dependencies:
-      - research
-      - analysis
-```
-
-This allows AgentFlow to determine which work can run independently and which work must wait.
-
----
-
-# Dependency-Aware Execution
-
-Dependencies are first-class workflow concepts.
-
-For example:
-
-```text
-                ┌─────────────┐
-                │  Research   │
-                └──────┬──────┘
-                       │
-             ┌─────────┴─────────┐
-             ▼                   ▼
-      ┌─────────────┐     ┌─────────────┐
-      │   Analysis  │     │   Research  │
-      │             │     │  Extension  │
-      └──────┬──────┘     └──────┬──────┘
-             │                   │
-             └─────────┬─────────┘
-                       ▼
-                ┌─────────────┐
-                │   Writing   │
-                └─────────────┘
-```
-
-Independent subtasks can execute without unnecessarily blocking each other.
-
-Dependent subtasks wait until their required outputs are available.
-
----
-
-# Tool Framework
-
-AgentFlow uses a unified tool framework.
-
-```text
-                         ToolExecutor
-                              │
-              ┌───────────────┴───────────────┐
-              │                               │
-        Custom Tools                      MCP Tools
-              │                               │
-      ┌───────┼────────┐              ┌───────┴───────┐
-      │       │        │              │               │
-     File    Code     API           MCP Adapter     MCP Client
-     Tools   Tools    Tools             │               │
-      │       │        │                └───────┬───────┘
-      └───────┴────────┘                        │
-              │                              MCP Server
-              └──────────────┬─────────────────┘
-                             ▼
-                       Tool Result
-```
-
-The tool system separates:
-
-- Tool definition
-- Tool registration
-- Authorization
-- Schema validation
-- Execution
-- Rate limiting
-- Invocation logging
-- Failure tracking
-
----
-
-# Built-in Tools
-
-The current implementation includes:
-
-| Tool | Purpose |
-|---|---|
-| `file_read` | Read files inside the configured workspace |
-| `file_write` | Write files inside the configured workspace |
-| `code_execution` | Execute Python with timeout controls |
-| `web_search` | Perform web searches |
-| `database_query` | Execute safe read-only database queries |
-| `api_call` | Perform controlled HTTPS API calls |
-| MCP tools | Dynamically discovered external tools |
-
-The initial tool set follows the implementation guide's Phase 1 design, which calls for web search, file read/write, sandboxed code execution, database queries, and API calls. :contentReference[oaicite:2]{index=2}
-
----
-
-# Tool Authorization
-
-Agents do not automatically have access to every tool.
-
-Each tool has an explicit authorization policy.
-
-Example:
-
-```text
-file_read
- ├── research       ✓
- ├── writing        ✓
- ├── data_analysis ✗
- └── code_execution ✗
-```
-
-Tool definitions contain:
-
-- Name
-- Description
-- Input schema
-- Output schema
-- Allowed specialists
-- Rate limits
-
-The `ToolRegistry` controls registration and lookup while the `ToolExecutor` enforces execution policy.
-
----
-
-# Tool Contracts
-
-Tool execution is validated at the boundary.
-
-The framework supports:
-
-- Input schema validation
-- Output schema validation
-- Authorization checks
-- Invocation tracking
-- Latency measurement
-- Rate limiting
-- Success/failure recording
-
-This prevents agents from bypassing the execution layer and calling infrastructure directly.
-
----
-
-# MCP Integration
-
-AgentFlow supports the **Model Context Protocol (MCP)** as an extensible external tool layer.
-
-MCP tools are adapted into AgentFlow's internal tool abstraction.
-
-This means an agent can use:
-
-```text
-Custom Tool
-```
-
-or:
-
-```text
-MCP Tool
-```
-
-through the same:
-
-```text
-ToolExecutor
-```
-
-interface.
-
-Current MCP capabilities include:
-
-- MCP tool discovery
-- MCP tool registration
-- MCP tool adapter
-- MCP stdio client
-- MCP server communication
-- MCP tool execution through `ToolExecutor`
-
-This architecture allows external MCP servers to extend AgentFlow without requiring every agent to implement MCP-specific logic.
-
----
-
-# Security Boundaries
-
-The tool layer contains several security-oriented controls.
-
-### File tools
-
-Workspace restrictions prevent path traversal outside the configured workspace.
-
-### Database tool
-
-The database query tool rejects write operations.
-
-### API tool
-
-The API tool enforces:
-
-- HTTPS
-- Host allowlisting
-
-### Code execution
-
-Code execution includes:
-
-- Timeout enforcement
-- Empty-code validation
-- Maximum timeout limits
-- Sandbox abstraction
-
-### Tool access
-
-Specialists can only use tools explicitly authorized for them.
-
-These controls are intended as engineering boundaries, not as a claim of complete production isolation.
-
-Production deployment should additionally use OS/container isolation, network policies, secrets management, authentication, authorization, and resource limits.
-
----
-
-# Failure Handling
-
-AgentFlow treats failure as part of the workflow.
-
-A specialist failure does not automatically terminate the task.
-
-```text
-Specialist
-    │
-    ▼
-  Failure
-    │
-    ▼
-Retry Available?
-   / \
- Yes  No
-  │    │
-  ▼    ▼
-Retry Failed
-```
-
-The retry system tracks:
-
-- Retry count
-- Maximum retries
-- Failure reason
-- Retry feedback
-
-Once the retry limit is reached, execution enters a failed state.
-
----
-
-# Reviewer System
-
-The reviewer receives the specialist outputs and evaluates the overall result.
-
-The review is represented by a structured `ReviewResult`.
-
-The reviewer evaluates:
-
-- Approval
-- Quality score
-- Confidence
-- Feedback
-- Issues
-
-The routing logic is:
-
-```text
-                     Reviewer
-                        │
-             ┌──────────┼──────────┐
-             │          │          │
-        approved    rejected    low confidence
-             │          │          │
-             ▼          ▼          ▼
-         synthesis     retry     escalation
-```
-
-Rejected reviews can be retried until the configured retry limit is reached.
-
----
-
-# Confidence-Based Escalation
-
-AgentFlow treats confidence as a workflow signal.
-
-If reviewer confidence falls below the configured threshold:
-
-```text
-confidence < threshold
-          │
-          ▼
-      escalation
-```
-
-The Phase 1 implementation establishes the escalation boundary and preserves:
-
-- Escalation requirement
-- Escalation reason
-- Replanning requirement
-
-Persistent human approval, pause/resume, and durable human workflow are part of the planned Human-in-the-Loop phase.
-
----
-
-# LLM Routing
-
-AgentFlow contains an LLM abstraction layer so agents do not need to directly depend on provider-specific implementations.
-
-The architecture supports provider routing and fallback.
-
-Conceptually:
-
-```text
-                 Agent Request
-                      │
-                      ▼
-                 LLM Router
-                      │
-              ┌───────┴───────┐
-              │               │
-          Primary          Fallback
-          Provider         Provider
-              │               │
-              └───────┬───────┘
-                      ▼
-                 LLM Response
-```
-
-The current implementation includes provider fallback behavior and tests for routing/failure handling.
-
-The long-term architecture is intended to support multiple LLM providers behind the same agent-facing interface.
-
----
-
-# Memory Architecture
-
-Persistent memory is a core objective of the complete AgentFlow system.
-
-The planned architecture contains two memory layers.
-
-## Short-Term Working Memory
-
-Short-term memory is scoped to a task execution.
-
-It contains:
-
-- Current execution plan
-- Completed specialist outputs
-- Intermediate results
-- Error logs
-- Current execution context
-
-The implementation guide specifies Redis for this working-memory layer. :contentReference[oaicite:3]{index=3}
-
-```text
-Task
- │
- ▼
-Redis Working Memory
- │
- ├── Plan
- ├── Intermediate Results
- ├── Specialist Outputs
- └── Error Logs
-```
-
----
-
-## Long-Term Semantic Memory
-
-After task completion, the system is intended to extract and store useful information such as:
-
-- What the user asked for
-- Which approach worked
-- Which tools were used
-- Important domain facts
-- User preferences
-- Lessons from previous executions
-
-The guide specifies ChromaDB for semantic long-term memory. :contentReference[oaicite:4]{index=4}
-
-```text
-Completed Task
-      │
-      ▼
-Memory Extraction
-      │
-      ▼
-Embeddings
-      │
-      ▼
-ChromaDB
-```
-
-Future tasks can retrieve relevant memories before planning.
-
----
-
-# Planned Memory Retrieval
-
-The intended planning flow is:
-
-```text
-User Task
-    │
-    ▼
-Query Long-Term Memory
-    │
-    ├── Similar tasks
-    ├── Successful approaches
-    ├── Failed approaches
-    ├── User preferences
-    └── Domain knowledge
-    │
-    ▼
+### Core workflow
+
+``` text
+Task Intake
+    ↓
+Long-Term Memory Retrieval
+    ↓
 Supervisor Planning
-```
-
-Memory is therefore intended to influence planning rather than merely act as a historical log.
-
----
-
-# Human-in-the-Loop
-
-Human oversight is a fundamental part of the target architecture.
-
-The system is intended to escalate when conditions such as these occur:
-
-- Supervisor confidence is too low
-- A specialist repeatedly fails
-- A sensitive operation is requested
-- Reviewer quality is below threshold
-- The user explicitly requests human review
-
-The guide defines multiple approval levels:
-
-```text
-Notify
-   │
-   ▼
-Approve Action
-   │
-   ▼
-Approve Plan
-   │
-   ▼
-Take Over
-```
-
-The planned approval workflow pauses execution, packages the relevant context, places the request in a review queue, and waits for human action.
-
----
-
-# Human Review Interface
-
-The planned review interface will expose:
-
-- Original task
-- Execution progress
-- Current decision point
-- Agent's proposed action
-- Agent reasoning/context
-- Relevant memories
-- Similar past decisions
-- Approve
-- Modify
-- Reject
-- Take Over
-- Human-agent conversation
-
-The guide explicitly defines this as the Human-in-the-Loop interface for the later phase. :contentReference[oaicite:5]{index=5}
-
----
-
-# Observability
-
-The complete system is designed to provide full execution tracing.
-
-A task trace should capture:
-
-```text
-Task
- │
- ├── Supervisor planning
- │
- ├── Specialist execution
- │    ├── Tool calls
- │    ├── LLM calls
- │    └── Results
- │
- ├── Memory retrieval
- │
- ├── Reviewer evaluation
- │
- ├── Retry events
- │
- ├── Escalation events
- │
- └── Human decisions
-```
-
-The planned observability layer will track:
-
-- Agent decisions
-- Tool calls
-- LLM calls
-- Latency
-- Token usage
-- Cost
-- Errors
-- Confidence
-- Escalations
-- Human review time
-
-The implementation guide calls for OpenTelemetry-based execution tracing and a visual trace explorer. :contentReference[oaicite:6]{index=6}
-
----
-
-# Replay and Debugging
-
-A long-term goal is deterministic execution replay.
-
-A historical execution should be inspectable step-by-step:
-
-```text
-Original Task
-     │
-     ▼
-Planning
-     │
-     ▼
-Specialist A
-     │
-     ▼
-Tool Call
-     │
-     ▼
+    ↓
+Dependency-Aware Dispatch
+    ↓
+Specialists + Tools
+    ↓
 Reviewer
+    ├── Retry / feedback → Specialist
+    ├── Low confidence → Human Escalation
+    └── Approved → Synthesis
+                         ↓
+                       End
 ```
 
-An engineer should eventually be able to:
+### HITL resume workflow
 
-- Inspect every step
-- Inspect inputs/outputs
-- Modify an input
-- Replay from that point
-- Compare the new execution with the original
-- Diagnose where behavior diverged
-
-This is intended to make agent failures debuggable like conventional distributed systems.
-
----
-
-# Cost and Performance Tracking
-
-The target system will track execution economics.
-
-Per task:
-
-```text
-Total tokens
-Total LLM calls
-Total tool calls
-Total wall-clock time
-Human review time
-Total cost
+``` text
+Escalation
+    ↓
+Persisted Human Decision
+    ↓
+Celery Resume Task
+    ↓
+resume_after_human
+    ├── approve  → continue execution
+    ├── replan   → planning
+    └── reject   → terminal state
 ```
 
-Aggregated metrics will include:
+## Key Features
 
-- Cost per task type
-- Most expensive agents
-- Tool usage
-- Provider usage
-- Escalation rate
-- Latency
-- Failure rate
+### Supervisor-based task decomposition
 
-These metrics are part of the observability phase in the implementation guide. :contentReference[oaicite:7]{index=7}
+The Supervisor produces a typed `ExecutionPlan` containing:
 
----
+-   subtask ID;
+-   description;
+-   assigned specialist;
+-   required inputs;
+-   expected output;
+-   estimated complexity;
+-   dependency relationships.
 
-# Technology Stack
+Pydantic validation rejects invalid dependency graphs before execution.
 
-The target architecture from the implementation guide uses:
+### Specialized agents
 
-| Component | Technology | Purpose |
-|---|---|---|
-| Language | Python | Core implementation |
-| Orchestration | LangGraph | Agent state machine |
-| LLM Providers | Multi-provider | Agent model routing |
-| Tool Framework | Custom + MCP | Extensible capabilities |
-| Short-Term Memory | Redis | Task working memory |
-| Long-Term Memory | ChromaDB | Semantic memory |
-| Persistent State | PostgreSQL | Durable application state |
-| Queue | Redis + Celery | Async task execution |
-| Review UI | React / Streamlit | Human approval |
-| API | FastAPI | Service interface |
-| Containers | Docker / docker-compose | Deployment |
+  Agent            Responsibility
+  ---------------- -------------------------------------------
+  Supervisor       Task decomposition and orchestration
+  Research         Research and web-search workflows
+  Data Analysis    Data analysis and database/tool workflows
+  Writing          Structured writing and synthesis support
+  Code Execution   Programmatic/code-oriented tasks
+  Reviewer         Specialist-output validation
 
-The guide identifies LangGraph, custom + MCP tools, PostgreSQL + ChromaDB, Redis + Celery, React/Streamlit, and Docker as the target technology stack. :contentReference[oaicite:8]{index=8}
+### Tool-use layer
 
-> **Implementation note:** The repository is being built incrementally. Not every target infrastructure component above is implemented yet.
+Specialists interact with external capabilities through:
 
----
-
-# Project Structure
-
-```text
-agentflow/
-│
-├── .gitignore
-├── README.md
-│
-└── backend/
-    │
-    ├── app/
-    │   │
-    │   ├── agents/
-    │   │   ├── graph/
-    │   │   ├── llm/
-    │   │   ├── schemas/
-    │   │   └── tools/
-    │   │       ├── mcp/
-    │   │       └── sandbox/
-    │   │
-    │   ├── config.py
-    │   └── main.py
-    │
-    ├── tests/
-    │
-    ├── requirements.txt
-    └── .env
-```
-
-`backend/.env` is local-only and must never be committed.
-
-Use `.env.example` for public configuration documentation.
-
----
-
-# Current Implementation Status
-
-## Phase 1 — Complete
-
-Current test checkpoint:
-
-```text
-80 passed
+``` text
+Specialist
+    ↓
+Tool Runner
+    ↓
+Tool Executor
+    ↓
+Tool Registry
+    ↓
+Concrete Tool
 ```
 
 Implemented capabilities include:
 
-### Agent Architecture
+-   web search;
+-   read-only database querying;
+-   code execution;
+-   configured API access;
+-   tool invocation tracing.
 
-- Supervisor agent
-- Planner
-- Research specialist
-- Data analysis specialist
-- Writing specialist
-- Code execution specialist
-- Reviewer agent
+### Dependency-aware execution
 
-### Workflow
+Subtasks explicitly declare dependencies, allowing independent work to
+proceed without waiting for unrelated tasks while dependent tasks wait
+for required predecessors.
 
-- Task intake
-- Structured planning
-- Execution plans
-- Dependency validation
-- Dependency-aware dispatch
-- Specialist execution
-- Retry routing
-- Review routing
-- Review retry limits
-- Synthesis
-- Confidence routing
-- Escalation boundary
-- End-to-end workflow integration
+### Redis working memory
 
-### Tool Framework
+Task-scoped working memory stores:
 
-- `BaseTool`
-- `ToolDefinition`
-- `ToolRegistry`
-- `ToolExecutor`
-- Tool authorization
-- Input validation
-- Output validation
-- Invocation logging
-- Latency tracking
-- Rate limiting
-- Failure tracking
+-   execution plan;
+-   completed subtask outputs;
+-   intermediate results;
+-   error records.
 
-### Built-in Tools
+Redis namespaces are isolated by task ID:
 
-- File read
-- File write
-- Python code execution
-- Web search
-- Database query
-- API call
-
-### MCP
-
-- MCP adapter
-- MCP registry
-- MCP tool discovery
-- MCP stdio client
-- MCP tool invocation
-- MCP integration with `ToolExecutor`
-
-### LLM
-
-- LLM abstraction
-- Provider routing
-- Provider fallback
-- Router tests
-- Fallback tests
-
-### Testing
-
-The current test suite covers:
-
-- Execution contracts
-- Planner integration
-- Workflow dependencies
-- Specialist behavior
-- Specialist retries
-- Review schema
-- Review routing
-- Confidence escalation
-- Tool registry
-- Tool executor
-- Tool contracts
-- File tools
-- Code execution
-- Web search
-- Database query
-- API calls
-- MCP
-- LLM routing
-- End-to-end workflow execution
-
----
-
-# Phase Roadmap
-
-The project follows the six-phase structure from the implementation guide.
-
----
-
-## Phase 1 — Agent Architecture
-
-**Status: COMPLETE**
-
-Goals:
-
-- Agent hierarchy
-- Task decomposition
-- Execution plan
-- Tool registry
-- LangGraph state machine
-- Specialist execution
-- Review
-- Retry
-- Confidence escalation
-
-Current checkpoint:
-
-```text
-80 tests passing
+``` text
+agentflow:memory:{task_id}:plan
+agentflow:memory:{task_id}:subtask_outputs
+agentflow:memory:{task_id}:intermediate_results
+agentflow:memory:{task_id}:errors
 ```
 
----
+### ChromaDB long-term memory
 
-## Phase 2 — Memory System
+Completed executions can contribute reusable semantic memories such as
+successful approaches, task context, useful results, and execution
+metadata.
 
-**Status: NEXT**
+Future tasks retrieve relevant memories before planning.
 
-Goals:
+### Human-in-the-loop escalation
 
-### Short-Term Working Memory
+Execution can pause when human intervention is required because of low
+confidence, approval-sensitive actions, or explicit user escalation.
 
-Implement Redis-backed task memory containing:
+Persisted HITL information includes:
 
-- Execution plan
-- Specialist outputs
-- Intermediate results
-- Error logs
+-   escalation reason;
+-   escalation trigger;
+-   approval level;
+-   proposed action;
+-   human decision;
+-   human feedback;
+-   resume location.
 
-Memory should be scoped to the current task.
+Supported decisions include:
 
-### Long-Term Semantic Memory
-
-Implement ChromaDB-backed semantic memory for:
-
-- Previous tasks
-- Successful approaches
-- Failed approaches
-- Domain facts
-- User preferences
-- Tool usage
-
-### Memory-Aware Planning
-
-The supervisor should retrieve relevant historical memories before creating a new plan.
-
-### Memory Management
-
-Implement:
-
-- Importance scoring
-- Consolidation
-- Expiration
-- User memory management
-- Delete endpoint
-
----
-
-## Phase 3 — Human-in-the-Loop
-
-**Status: PLANNED**
-
-Goals:
-
-- Escalation triggers
-- Approval queue
-- Workflow pause
-- Human approval
-- Human rejection
-- Human modification
-- Human takeover
-- Approval levels
-- Resume after human decision
-- Replanning after feedback
-- Human-agent communication
-
----
-
-## Phase 4 — Observability and Debugging
-
-**Status: PLANNED**
-
-Goals:
-
-- Full execution traces
-- OpenTelemetry spans
-- Trace explorer
-- Agent decision inspection
-- Tool call inspection
-- LLM call inspection
-- Cost tracking
-- Latency tracking
-- Confidence tracking
-- Replay system
-
----
-
-## Phase 5 — Integration and End-to-End Testing
-
-**Status: PLANNED**
-
-The target demonstration scenario is a complex research task requiring:
-
-```text
-Web Search
-    ↓
-Data Extraction
-    ↓
-Analysis
-    ↓
-Written Summary
+``` text
+approve
+replan
+reject
 ```
 
-The demo should show:
+### Durable asynchronous resume
 
-1. Supervisor decomposition
-2. Parallel specialist execution
-3. Tool usage
-4. Reviewer validation
-5. Reviewer-driven retry
-6. Memory retrieval
-7. Human approval
-8. Final synthesis
-9. Full execution trace
+HITL does not depend on an in-memory pause in the API process.
 
-The guide also calls for Docker-based integration of the orchestration API, Redis, PostgreSQL, ChromaDB, Celery workers, trace explorer, and human review UI. :contentReference[oaicite:9]{index=9}
+``` text
+Escalated
+    ↓
+Human Decision
+    ↓
+Mark Resuming
+    ↓
+Celery
+    ↓
+LangGraph Resume
+    ↓
+Specialist / Review / Planning
+    ↓
+Synthesis
+```
 
----
+### Reviewer and confidence routing
 
-## Phase 6 — Portfolio and Production Polish
+Low-confidence specialist or reviewer results can trigger human
+escalation. Reviewer rejection can route work back for retry with
+feedback.
 
-**Status: PLANNED**
+``` text
+Specialist
+    ↓
+confidence check
+    ├── acceptable → Review
+    └── low        → HITL
+```
 
-The final demonstration should show the complete lifecycle:
+### Full execution tracing
 
-```text
-Complex Request
+Important workflow, agent, tool, memory, and human-decision operations
+are persisted as trace spans.
+
+A representative execution can appear as:
+
+``` text
+execution
+├── check_user_escalation
+├── retrieve_long_term_memory
+│   └── memory.retrieve
+├── planning
+│   └── llm.generate_structured
+├── specialist
+│   └── tool.web_search
+├── human_escalation
+├── human_decision
+├── execution.resume
+├── resume_after_human
+├── review
+└── synthesis
+```
+
+Trace data can include status, duration, inputs, outputs, token usage,
+cost information, tool calls, subtask IDs, and workflow metadata.
+
+### Trace Explorer and analytics
+
+The frontend provides:
+
+-   execution selection and inspection;
+-   persisted span inspection;
+-   execution metadata;
+-   latency, token, cost, and tool-call metrics;
+-   changed/added/removed span analysis;
+-   original-vs-replay comparison.
+
+### Selected-span replay
+
+A persisted specialist span can be replayed as a new execution.
+
+``` text
+Original Execution
       ↓
-Supervisor Planning
+Selected Span
       ↓
-Specialist Agents
+Persisted Source Subtask
       ↓
-Tool Calls
+Optional Input / Description Override
       ↓
-Review
+New Execution
       ↓
+Independent Replay
+      ↓
+Original vs Replay Comparison
+```
+
+The comparison exposes changes in:
+
+-   execution status;
+-   latency;
+-   tokens;
+-   tool calls;
+-   cost;
+-   inputs;
+-   outputs;
+-   spans.
+
+## Technology Stack
+
+  Layer              Technology
+  ------------------ --------------------------------------------
+  Language           Python 3.12
+  API                FastAPI
+  Orchestration      LangGraph
+  Validation         Pydantic
+  LLM Layer          LLM Router / Google GenAI in verified runs
+  Agents             Custom Python agents
+  Tools              Custom registry and executor
+  Working Memory     Redis
+  Long-Term Memory   ChromaDB
+  Durable Storage    PostgreSQL
+  Async Execution    Celery
+  Queue / Broker     Redis
+  Frontend           React
+  Containers         Docker / Docker Compose
+  Testing            Pytest
+
+## Service Architecture
+
+``` text
+┌──────────────────────────────────────────────┐
+│                 Docker Compose               │
+│                                              │
+│  React Frontend ─────► FastAPI Backend       │
+│                              │               │
+│             ┌────────────────┼───────────┐   │
+│             ▼                ▼           ▼   │
+│        PostgreSQL          Redis       Chroma│
+│        durable data     queue/memory    memory│
+│             ▲                │           ▲   │
+│             │                ▼           │   │
+│             │          Celery Worker ─────┘   │
+│             │                │               │
+│             └────────────────┘               │
+└──────────────────────────────────────────────┘
+```
+
+## Repository Structure
+
+``` text
+agentflow/
+├── backend/
+│   ├── app/
+│   │   ├── agents/
+│   │   │   ├── analysis/
+│   │   │   ├── coding/
+│   │   │   ├── research/
+│   │   │   ├── reviewer/
+│   │   │   ├── supervisor/
+│   │   │   ├── writing/
+│   │   │   └── tool_runner/
+│   │   ├── api/
+│   │   │   └── routes/
+│   │   ├── db/
+│   │   │   ├── models/
+│   │   │   └── repositories/
+│   │   ├── graph/
+│   │   │   └── workflow.py
+│   │   ├── memory/
+│   │   │   ├── redis_store.py
+│   │   │   └── chroma_store.py
+│   │   ├── tasks/
+│   │   │   ├── execution.py
+│   │   │   └── resume.py
+│   │   ├── tools/
+│   │   │   ├── builtin_registry.py
+│   │   │   ├── executor.py
+│   │   │   └── code_execution.py
+│   │   ├── llm/
+│   │   │   └── router.py
+│   │   └── schemas/
+│   │       ├── execution.py
+│   │       ├── review.py
+│   │       └── human_decision.py
+│   └── tests/
+├── frontend/
+├── docker-compose.yml
+└── README.md
+```
+
+## Execution Lifecycle
+
+### Normal execution
+
+1.  API receives a task.
+2.  Execution is created.
+3.  Celery queues background execution.
+4.  LangGraph retrieves relevant long-term memory.
+5.  Supervisor generates a structured plan.
+6.  Subtasks are persisted.
+7.  Ready subtasks are dependency-dispatched.
+8.  Specialists execute and use authorized tools.
+9.  Outputs are accumulated in working memory.
+10. Reviewer validates the results.
+11. Failed or rejected work can be retried.
+12. Low-confidence work can escalate to a human.
+13. Approved work is synthesized.
+14. Final state and traces are persisted.
+
+### HITL execution
+
+``` text
+Specialist / Reviewer
+        ↓
+Confidence / Policy Check
+        ↓
+Human Escalation
+        ↓
+Pending Decision
+        ├── approve → resume
+        ├── replan  → planning
+        └── reject  → terminal state
+```
+
+### Selected-span replay
+
+``` text
+Persisted Execution
+        ↓
+Select Span
+        ↓
+Load Source Subtask
+        ↓
+Optional Input Override
+        ↓
+Create New Execution
+        ↓
+Run Selected Specialist Path
+        ↓
+Persist Replay Trace
+        ↓
+Compare Original vs Replay
+```
+
+## API Capabilities
+
+The API layer supports:
+
+-   task and execution creation;
+-   execution inspection;
+-   HITL state inspection;
+-   human decision submission;
+-   resume/retry of human decisions;
+-   execution traces;
+-   observability analytics;
+-   selected-span replay;
+-   original-vs-replay comparison.
+
+The API and worker are separated so long-running agent execution does
+not block the request process.
+
+## Testing
+
+Latest full-suite verification:
+
+``` text
+347 passed
+2 warnings
+26.28s
+```
+
+The verified end-to-end path includes:
+
+``` text
+planning
+→ specialist execution
+→ low-confidence escalation
+→ persisted human decision
+→ Celery resume
+→ resume_after_human
+→ review
+→ synthesis
+→ completed execution
+```
+
+Replay verification includes:
+
+``` text
+original execution
+→ selected specialist span
+→ new replay execution
+→ replay completion
+→ original-vs-replay comparison
+```
+
+## Running Locally
+
+### Prerequisites
+
+-   Docker
+-   Docker Compose
+-   configured LLM credentials in `backend/.env`
+
+### Start the stack
+
+``` bash
+docker compose up --build
+```
+
+### Services
+
+``` text
+Frontend       http://localhost:5173
+Backend API    http://localhost:8000
+PostgreSQL     localhost:5432
+Redis          localhost:6379
+ChromaDB       localhost:8001
+```
+
+### Run tests
+
+``` bash
+docker compose exec backend python -m pytest -q
+```
+
+### Follow worker logs
+
+``` bash
+docker compose logs -f celery-worker
+```
+
+### Follow backend logs
+
+``` bash
+docker compose logs -f backend
+```
+
+## Example Execution
+
+A representative task:
+
+``` json
+{
+  "description": "Research a topic, analyze the findings, and produce a concise report."
+}
+```
+
+can become:
+
+``` text
+Supervisor
+   │
+   ├── Research
+   │      └── web_search
+   │
+   ├── Analysis
+   │      └── analysis/database tools
+   │
+   └── Writing
+          └── specialist outputs
+                │
+                ▼
+             Reviewer
+                │
+                ▼
+             Synthesis
+```
+
+If confidence is below the configured threshold:
+
+``` text
+Specialist
+   ↓
+confidence = 0.30
+threshold = 0.50
+   ↓
+Human Escalation
+   ↓
 Human Approval
-      ↓
-Memory Update
-      ↓
-Final Result
-      ↓
-Trace Explorer
+   ↓
+Celery Resume
+   ↓
+Review
+   ↓
+Synthesis
+   ↓
+Completed
 ```
 
-The intended portfolio narrative is:
+## Engineering Highlights
 
-> **I built a multi-agent orchestration system where AI agents decompose complex tasks, use tools to execute them, learn from past interactions through persistent memory, and escalate to humans when confidence is low. It is designed as infrastructure for autonomous AI workflows rather than a single-agent demo.**
+### Stateful orchestration
 
-This framing follows the project's implementation guide. :contentReference[oaicite:10]{index=10}
+LangGraph provides explicit workflow state and conditional routing
+instead of hiding the entire workflow inside a monolithic agent prompt.
 
----
+### Separation of concerns
 
-# Development Philosophy
-
-AgentFlow is being implemented incrementally.
-
-Each architectural capability should have:
-
-```text
-Design
-  ↓
-Contract
-  ↓
-Implementation
-  ↓
-Unit Tests
-  ↓
-Integration Tests
-  ↓
-System Tests
+``` text
+API
+ ↓
+Task Queue
+ ↓
+Workflow
+ ↓
+Agents
+ ↓
+Tools
+ ↓
+Memory / Persistence
+ ↓
+Observability
 ```
 
-The test suite is treated as an architectural contract.
-
-A feature is not considered complete merely because the code runs.
-
-It should have automated tests covering its expected behavior and failure modes.
-
----
-
-# Testing
-
-From the backend directory:
-
-```bash
-cd backend
-python -m pytest -q
-```
-
-Current Phase 1 result:
-
-```text
-80 passed
-```
-
-Run workflow tests:
-
-```bash
-python -m pytest tests/test_workflow_integration.py -v
-```
-
-Run specialist retry tests:
-
-```bash
-python -m pytest tests/test_specialist_retry.py -v
-```
-
-Run review tests:
-
-```bash
-python -m pytest tests/test_review_routing.py tests/test_confidence_escalation.py -v
-```
-
-Run tool tests:
-
-```bash
-python -m pytest tests/test_tool_executor.py \
-    tests/test_file_read_tool.py \
-    tests/test_file_write_tool.py \
-    tests/test_code_execution_tool.py -v
-```
-
-Run MCP tests:
-
-```bash
-python -m pytest tests/test_mcp_tools.py \
-    tests/test_mcp_stdio_client.py -v
-```
-
-Run the entire suite:
-
-```bash
-python -m pytest -q
-```
-
----
-
-# Local Development
-
-## Requirements
-
-Current development environment:
-
-```text
-Python 3.12+
-pytest
-LangGraph
-Pydantic
-MCP
-```
-
-The project targets Python 3.11+ in the architecture guide.
-
----
-
-## Create Environment
-
-Windows:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-Linux/macOS:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
----
-
-## Install Dependencies
-
-```bash
-cd backend
-pip install -r requirements.txt
-```
-
----
-
-# Environment Variables
-
-Create:
-
-```text
-backend/.env
-```
-
-Example public template:
-
-```env
-GEMINI_API_KEY=
-OPENROUTER_API_KEY=
-```
-
-Additional provider configuration can be added as the LLM routing layer evolves.
-
-Never commit:
-
-```text
-.env
-```
-
-to source control.
-
----
-
-# Design Decisions
-
-## Why LangGraph?
-
-AgentFlow requires explicit state transitions, conditional routing, retries, parallel/sequential execution, and durable workflow semantics.
-
-LangGraph provides the state-machine abstraction required for this style of orchestration.
-
----
-
-## Why Structured Schemas?
-
-LLM output should not be trusted as arbitrary text at system boundaries.
-
-Structured Pydantic models provide:
-
-- Validation
-- Explicit contracts
-- Predictable state
-- Easier testing
-- Safer routing
-
----
-
-## Why a Custom Tool Framework?
-
-Agents should not directly own infrastructure integrations.
-
-Instead:
-
-```text
-Agent
-  ↓
-ToolExecutor
-  ↓
-Tool
-```
-
-This allows authorization, validation, logging, and rate limiting to be enforced centrally.
-
----
-
-## Why MCP?
-
-A custom tool framework gives AgentFlow control over its own internal tools.
-
-MCP provides an extensible protocol for connecting external tool servers.
-
-Combining both gives:
-
-```text
-AgentFlow-native tools
-        +
-External MCP ecosystem
-```
-
-without forcing agents to understand the implementation details of either.
-
----
-
-## Why Human-in-the-Loop?
-
-Autonomy should not mean unrestricted autonomy.
-
-Some operations require:
-
-- Higher confidence
-- Explicit authorization
-- Human judgment
-- Business approval
-- Sensitive-action confirmation
-
-AgentFlow therefore treats human intervention as a normal workflow state rather than an exceptional error.
-
----
-
-## Why Persistent Memory?
-
-Without memory, every task begins from zero.
-
-Persistent memory allows future planning to benefit from:
-
-- Previous successful approaches
-- Previous failures
-- User preferences
-- Relevant facts
-- Historical tool usage
-
-This is intended to make the system improve over repeated interactions.
-
----
-
-# Security Model
-
-AgentFlow is designed with defense-in-depth principles.
-
-Current boundaries include:
-
-```text
-Agent
-  │
-  ▼
-Authorization
-  │
-  ▼
-Schema Validation
-  │
-  ▼
-Rate Limiting
-  │
-  ▼
-Tool Execution
-  │
-  ▼
-Result Validation
-  │
-  ▼
-Invocation Logging
-```
-
-Additional production security will be added as the system moves toward the later phases.
-
----
-
-# Non-Goals
-
-AgentFlow is not intended to be:
-
-- A simple chatbot
-- A single prompt wrapper
-- A collection of independent LLM demos
-- An unrestricted code execution environment
-- A replacement for enterprise authorization systems
-- A claim that autonomous agents can safely operate without governance
-
-The purpose is to explore the engineering infrastructure required to make autonomous agent workflows **controlled, observable, recoverable, and extensible**.
-
----
-
-# Future Architecture
-
-The intended final architecture is:
-
-```text
-                           ┌─────────────────────┐
-                           │       Client        │
-                           └──────────┬──────────┘
-                                      │
-                                      ▼
-                           ┌─────────────────────┐
-                           │     FastAPI API     │
-                           └──────────┬──────────┘
-                                      │
-                                      ▼
-                           ┌─────────────────────┐
-                           │   Agent Orchestrator│
-                           │      LangGraph      │
-                           └──────────┬──────────┘
-                                      │
-              ┌───────────────────────┼────────────────────────┐
-              │                       │                        │
-              ▼                       ▼                        ▼
-        ┌──────────┐            ┌──────────┐            ┌──────────┐
-        │Supervisor│            │Specialists│           │ Reviewer │
-        └────┬─────┘            └────┬─────┘            └────┬─────┘
-             │                       │                       │
-             └───────────────────────┼───────────────────────┘
-                                     │
-                                     ▼
-                              ┌──────────────┐
-                              │ ToolExecutor │
-                              └──────┬───────┘
-                                     │
-                    ┌────────────────┼────────────────┐
-                    │                │                │
-                    ▼                ▼                ▼
-                 Custom             MCP             Sandbox
-                  Tools            Tools             Tools
-                    │                │                │
-                    └────────────────┼────────────────┘
-                                     │
-                                     ▼
-                              ┌──────────────┐
-                              │    Memory    │
-                              ├──────────────┤
-                              │ Redis        │
-                              │ PostgreSQL   │
-                              │ ChromaDB     │
-                              └──────────────┘
-                                     │
-                                     ▼
-                              ┌──────────────┐
-                              │ Observability│
-                              ├──────────────┤
-                              │ Traces       │
-                              │ Metrics      │
-                              │ Costs        │
-                              │ Replay       │
-                              └──────────────┘
-                                     │
-                                     ▼
-                              ┌──────────────┐
-                              │ Human Review │
-                              │     UI       │
-                              └──────────────┘
-```
-
----
-
-# Project Milestones
-
-```text
-Phase 1  ████████████████████  COMPLETE
-Phase 2  ░░░░░░░░░░░░░░░░░░░░  NEXT
-Phase 3  ░░░░░░░░░░░░░░░░░░░░  PLANNED
-Phase 4  ░░░░░░░░░░░░░░░░░░░░  PLANNED
-Phase 5  ░░░░░░░░░░░░░░░░░░░░  PLANNED
-Phase 6  ░░░░░░░░░░░░░░░░░░░░  PLANNED
-```
-
-Current milestone:
-
-```text
-PHASE 1
-80 TESTS PASSING
-```
-
----
-
-# Repository Status
-
-AgentFlow is an actively developed engineering project.
-
-The current implementation has completed the initial orchestration foundation and is now moving toward:
-
-1. Persistent memory
-2. Human-in-the-loop execution
-3. Durable workflow state
-4. Full observability
-5. End-to-end production-style deployment
-
-The implementation deliberately proceeds incrementally so each architectural layer can be validated before the next one is introduced.
-
----
-
-# License
-
-License information will be added before the first public release.
-
----
-
-# Acknowledgements
-
-The architecture and phased implementation plan for this project are based on the **AI Engineering Projects Guide — Project 15: Agent Orchestration System with Tool Use, Memory, and Human-in-the-Loop**.
-
-The implementation is an engineering realization of that architectural blueprint, with implementation decisions and testing added during development.
+### Durable execution boundaries
+
+Execution state is persisted across API, Celery, PostgreSQL, and Redis
+boundaries so HITL workflows can resume independently of the original
+API process.
+
+### Controlled tool access
+
+Specialists interact with external capabilities through a registry and
+executor boundary rather than directly invoking arbitrary
+infrastructure.
+
+### Typed agent contracts
+
+Pydantic schemas enforce structured plans, subtasks, review results, and
+human decisions.
+
+### Debuggable agent behavior
+
+Trace persistence and selected-span replay make agent execution
+inspectable, reproducible, and comparable instead of treating it as an
+opaque LLM call.
+
+## Project Scope
+
+Current implementation covers:
+
+-   multi-agent hierarchy;
+-   structured task planning;
+-   dependency-aware specialist execution;
+-   tool registry and execution;
+-   Redis working memory;
+-   ChromaDB long-term memory;
+-   reviewer-based validation;
+-   confidence-based escalation;
+-   persistent HITL decisions;
+-   Celery-based resume;
+-   PostgreSQL persistence;
+-   execution tracing;
+-   observability analytics;
+-   Trace Explorer;
+-   selected-span replay;
+-   original-vs-replay comparison;
+-   Docker Compose deployment;
+-   automated testing.
+
+**Kubernetes deployment is intentionally outside the current
+implementation scope.**
+
+## Portfolio Summary
+
+**AgentFlow is a production-oriented multi-agent orchestration platform
+that coordinates a Supervisor, domain-specialist agents, tools, memory,
+reviewer validation, and human-in-the-loop escalation through a stateful
+LangGraph workflow. It persists execution state in PostgreSQL and Redis,
+stores semantic long-term memory in ChromaDB, executes workloads
+asynchronously with Celery, and provides end-to-end observability with
+trace exploration, analytics, and selected-span replay for debugging
+agent behavior.**
+
+## What This Project Demonstrates
+
+-   Multi-agent system architecture
+-   LangGraph workflow orchestration
+-   Structured LLM outputs
+-   Agent specialization and routing
+-   Dependency-aware execution
+-   Tool-use architecture
+-   Short-term and long-term memory
+-   Semantic retrieval
+-   Human-in-the-loop workflows
+-   Durable asynchronous execution
+-   Celery task processing
+-   PostgreSQL persistence
+-   Redis state and queue infrastructure
+-   ChromaDB vector memory
+-   Execution tracing
+-   Observability analytics
+-   Agent replay and debugging
+-   Docker-based service orchestration
+-   End-to-end testing
+
+## License
+
+Add the license appropriate for the repository before publishing.

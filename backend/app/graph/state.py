@@ -11,8 +11,33 @@ from app.schemas.review import ReviewResult
 
 class AgentGraphState(TypedDict, total=False):
     task_id: str
+    execution_id: str
     user_id: str
     description: str
+    context: dict[str, Any]
+    # ---------------------------------------------------------
+    # Replay
+    # ---------------------------------------------------------
+
+    replay_source_execution_id: str | None
+
+    replay_source_span_id: str | None
+
+    replay_target_subtask_id: str | None
+
+    # Stable logical selector for replay. The original subtask UUID is
+    # execution-specific and normally changes when the replay is planned.
+    replay_target_subtask_description: str | None
+    replay_target_specialist: str | None
+    replay_target_span_name: str | None
+    replay_target_span_kind: str | None
+    replay_source_subtask: SubTask | None
+
+    # When true, replay dispatches only the selected logical subtask and
+    # terminates after that specialist finishes.
+    replay_only: bool
+
+    replay_input_override: Any
 
     # Memory
     long_term_memories: list[dict[str, Any]]
@@ -85,6 +110,23 @@ class SpecialistBranchState(TypedDict, total=False):
     task_id: str
     user_id: str
     description: str
+    context: dict[str, Any]
+
+    replay_source_execution_id: str | None
+
+    replay_source_span_id: str | None
+
+    replay_target_subtask_id: str | None
+
+    replay_target_subtask_description: str | None
+    replay_target_specialist: str | None
+    replay_target_span_name: str | None
+    replay_target_span_kind: str | None
+    replay_source_subtask: SubTask | None
+    
+    replay_only: bool
+
+    replay_input_override: Any
 
     plan: ExecutionPlan
     current_subtask: SubTask

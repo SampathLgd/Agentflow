@@ -1,18 +1,15 @@
 from fastapi import FastAPI
 
 from app.api.routes.hitl import router as hitl_router
-from app.api.routes.memory import (
-    router as memory_router,
-)
+from app.api.routes.memory import router as memory_router
+from app.api.routes.trace import router as trace_router
 from app.config import get_settings
 from app.llm.router import LLMRouter
 from fastapi.middleware.cors import CORSMiddleware
 
 settings = get_settings()
 
-llm_router = LLMRouter(
-    settings
-)
+llm_router = LLMRouter(settings)
 
 app = FastAPI(
     title=settings.app_name,
@@ -30,13 +27,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(
-    hitl_router
-)
-
-app.include_router(
-    memory_router
-)
+app.include_router(hitl_router)
+app.include_router(memory_router)
+app.include_router(trace_router)
 
 
 @app.get("/health")

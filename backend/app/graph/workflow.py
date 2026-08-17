@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID, uuid4
+import inspect
 
+from app.observability.tracing import (
+    annotate_current_span,
+    current_trace,
+)
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from app.memory.service import MemoryService
@@ -29,7 +35,7 @@ from app.memory.long_term import (
 )
 
 from app.schemas.agent import AgentInput
-from app.schemas.execution import Specialist, SubTask
+from app.schemas.execution import ExecutionPlan, Specialist, SubTask
 from app.schemas.review import ReviewResult
 
 
@@ -64,6 +70,196 @@ def _get_ready_subtasks(
 
     return ready
 
+
+def _normalize_replay_text(
+    value: str | None,
+) -> str:
+    """
+    Normalize text used to match a replay target across executions.
+
+    UUIDs are intentionally ignored because the supervisor creates fresh
+    subtask IDs for every new execution.
+    """
+    if not value:
+        return ""
+
+    return " ".join(
+        str(value)
+        .strip()
+        .lower()
+        .split()
+    )
+
+
+def _replay_subtask_matches(
+    subtask: SubTask,
+    state: AgentGraphState,
+) -> bool:
+    """
+    Match the newly-created replay subtask against the ORIGINAL
+    source subtask.
+
+    IMPORTANT:
+    replay_target_subtask_id refers to the source execution's
+    subtask UUID. The replay execution intentionally creates a
+    NEW subtask UUID, so replay UUIDs are never compared directly.
+    """
+
+    # Direct/unit-test replay may identify the exact source subtask
+    # without setting replay_only.  When the supplied target UUID
+    # matches the current subtask, treat it as the replay target.
+    #
+    # Full selected-span replay still uses logical matching because
+    # the replay plan creates a fresh subtask UUID.
+    target_subtask_id = state.get("replay_target_subtask_id")
+    if target_subtask_id:
+        try:
+            if str(subtask.id) == str(target_subtask_id):
+                return True
+        except Exception:
+            pass
+
+    if not state.get("replay_only", False):
+        return False
+
+    current_description = _normalize_replay_text(
+        subtask.description
+    )
+
+    current_specialist = _normalize_replay_text(
+        getattr(
+            subtask.assigned_specialist,
+            "value",
+            str(subtask.assigned_specialist),
+        )
+    )
+
+    source_subtask = state.get("replay_source_subtask")
+
+    if source_subtask is not None:
+        source_description = _normalize_replay_text(
+            getattr(source_subtask, "description", None)
+        )
+
+        source_specialist_value = getattr(
+            source_subtask,
+            "assigned_specialist",
+            None,
+        )
+        source_specialist = _normalize_replay_text(
+            getattr(
+                source_specialist_value,
+                "value",
+                str(source_specialist_value)
+                if source_specialist_value is not None
+                else "",
+            )
+        )
+
+        if (
+            source_description
+            and current_description == source_description
+            and source_specialist
+            and current_specialist == source_specialist
+        ):
+            return True
+
+    target_description = _normalize_replay_text(
+        state.get("replay_target_subtask_description")
+    )
+
+    target_specialist = _normalize_replay_text(
+        state.get("replay_target_specialist")
+    )
+
+    if (
+        target_description
+        and current_description == target_description
+    ):
+        if (
+            target_specialist
+            and current_specialist != target_specialist
+        ):
+            return False
+
+        return True
+
+    replay_override = state.get("replay_input_override")
+
+    if isinstance(replay_override, dict):
+        override_description = _normalize_replay_text(
+            replay_override.get("original_description")
+            or replay_override.get("target_description")
+        )
+
+        override_specialist = _normalize_replay_text(
+            replay_override.get("specialist")
+            or replay_override.get("assigned_specialist")
+        )
+
+        if (
+            override_description
+            and current_description == override_description
+        ):
+            if (
+                override_specialist
+                and current_specialist != override_specialist
+            ):
+                return False
+
+            return True
+
+    return False
+
+def _get_replay_target_subtask(
+    plan,
+    state: AgentGraphState,
+) -> SubTask | None:
+    """
+    Resolve the single replay target from the NEW replay plan.
+
+    The replay plan contains a NEW subtask UUID. Matching is performed
+    using the persisted source subtask's logical identity.
+    """
+
+    if not state.get("replay_only", False):
+        return None
+
+    candidates = [
+        subtask
+        for subtask in plan.subtasks
+        if _replay_subtask_matches(
+            subtask,
+            state,
+        )
+    ]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if len(candidates) > 1:
+        target_specialist = _normalize_replay_text(
+            state.get("replay_target_specialist")
+        )
+
+        if target_specialist:
+            specialist_candidates = [
+                subtask
+                for subtask in candidates
+                if _normalize_replay_text(
+                    getattr(
+                        subtask.assigned_specialist,
+                        "value",
+                        str(subtask.assigned_specialist),
+                    )
+                )
+                == target_specialist
+            ]
+
+            if len(specialist_candidates) == 1:
+                return specialist_candidates[0]
+
+    return None
 
 def _all_subtasks_completed(
     plan,
@@ -100,6 +296,35 @@ def route_after_specialists(
     )
 
     # --------------------------------------------------------
+    # Selected-span replay is intentionally a single-specialist
+    # execution. Do not dispatch the same target again and do not
+    # run the normal review/synthesis pipeline.
+    # --------------------------------------------------------
+
+    if state.get("replay_only", False):
+        if failure_reason:
+            retry_count = int(
+                state.get(
+                    "retry_count",
+                    0,
+                )
+            )
+
+            max_retries = int(
+                state.get(
+                    "max_retries",
+                    2,
+                )
+            )
+
+            if retry_count < max_retries:
+                return "retry"
+
+            return "failed"
+
+        return "replay_finalize"
+
+    # --------------------------------------------------------
     # Specialist failure / retry
     # --------------------------------------------------------
 
@@ -124,9 +349,8 @@ def route_after_specialists(
         return "failed"
 
     # --------------------------------------------------------
-    # Specialist confidence
+    # Normal confidence routing
     # --------------------------------------------------------
-
     confidence = float(
         state.get(
             "specialist_confidence",
@@ -776,6 +1000,7 @@ def build_workflow(
     working_memory: WorkingMemoryStore | None = None,
     long_term_memory: LongTermMemoryStore | None = None,
     memory_service: MemoryService | None = None,
+    persist_plan_subtasks=None,
 ):
     """
     Build the AgentFlow orchestration graph.
@@ -837,6 +1062,99 @@ def build_workflow(
     graph = StateGraph(
         AgentGraphState
     )
+
+    # ========================================================
+    # Observability helpers
+    # ========================================================
+
+    def _traced_node(
+        name: str,
+        fn,
+        *,
+        kind: str = "workflow_node",
+    ):
+        """
+        Wrap a LangGraph node in an execution-trace span.
+
+        The wrapper supports both synchronous and asynchronous nodes.
+        Child LLM/tool spans created inside the node automatically become
+        children of the workflow-node span through the tracing ContextVar.
+        """
+
+        def _metadata(state: Any) -> dict[str, Any]:
+            metadata: dict[str, Any] = {
+                "workflow_node": name,
+            }
+
+            if not isinstance(state, dict):
+                return metadata
+
+            current_subtask = state.get("current_subtask")
+
+            if current_subtask is not None:
+                try:
+                    metadata["subtask_id"] = str(
+                        current_subtask.id
+                    )
+                except Exception:
+                    pass
+
+                specialist = getattr(
+                    current_subtask,
+                    "assigned_specialist",
+                    None,
+                )
+
+                if specialist is not None:
+                    metadata["specialist"] = getattr(
+                        specialist,
+                        "value",
+                        str(specialist),
+                    )
+
+            return metadata
+
+        if inspect.iscoroutinefunction(fn):
+
+            async def async_wrapper(state):
+                with current_trace(
+                    name=name,
+                    kind=kind,
+                    **_metadata(state),
+                ):
+                    annotate_current_span(
+                        input_value=state,
+                    )
+
+                    result = await fn(state)
+
+                    annotate_current_span(
+                        output=result,
+                    )
+
+                    return result
+
+            return async_wrapper
+
+        def sync_wrapper(state):
+            with current_trace(
+                name=name,
+                kind=kind,
+                **_metadata(state),
+            ):
+                annotate_current_span(
+                    input_value=state,
+                )
+
+                result = fn(state)
+
+                annotate_current_span(
+                    output=result,
+                )
+
+                return result
+
+        return sync_wrapper
 
     # ========================================================
     # Working-memory helpers
@@ -951,11 +1269,116 @@ def build_workflow(
         state: AgentGraphState,
     ) -> dict[str, Any]:
         """
-        Ask the supervisor to create the execution plan.
+        Build the execution plan.
 
-        A replanning decision intentionally starts a new plan
-        and resets execution-progress state.
+        Normal execution:
+            Ask the supervisor to create a fresh plan.
+
+        Selected-span replay:
+            Reuse the persisted source SubTask definition and DO NOT
+            ask the LLM planner to regenerate the selected step.
+
+        This makes selected-span replay deterministic even when the
+        supervisor produces different wording or a different plan on
+        a new execution.
         """
+
+        # ========================================================
+        # Selected-span replay
+        # ========================================================
+
+        if state.get("replay_only", False):
+            replay_source_subtask = state.get(
+                "replay_source_subtask"
+            )
+
+            if replay_source_subtask is None:
+                raise ValueError(
+                    "Selected replay requires the persisted "
+                    "source subtask definition."
+                )
+
+            # The source SubTask belongs to the original execution.
+            # It is copied into a new execution plan with a new UUID.
+            #
+            # Dependencies are intentionally removed because a selected
+            # span replay executes only the selected specialist step.
+            replay_subtask = SubTask(
+                id=uuid4(),
+                description=str(
+                    replay_source_subtask.description
+                ),
+                assigned_specialist=(
+                    replay_source_subtask.assigned_specialist
+                ),
+                required_inputs=list(
+                    replay_source_subtask.required_inputs or []
+                ),
+                expected_output=str(
+                    replay_source_subtask.expected_output
+                ),
+                estimated_complexity=(
+                    replay_source_subtask.estimated_complexity
+                ),
+                dependencies=[],
+            )
+
+            plan = ExecutionPlan(
+                task_id=UUID(state["task_id"]),
+                subtasks=[replay_subtask],
+            )
+
+            if persist_plan_subtasks is not None:
+                await persist_plan_subtasks(
+                    execution_id=UUID(
+                        state["execution_id"]
+                    ),
+                    subtasks=plan.subtasks,
+                )
+
+            ready = [replay_subtask]
+
+            if working_memory is not None:
+                await working_memory.set_plan(
+                    state["task_id"],
+                    plan.model_dump(mode="json"),
+                )
+
+            return {
+                "plan": plan,
+                "ready_subtasks": ready,
+                "completed_subtasks": [],
+                "specialist_outputs": [],
+                "retry_count": 0,
+                "failure_reason": "",
+                "retry_feedback": "",
+                "review_retry_count": 0,
+                "review_feedback": "",
+                "review": None,
+                "specialist_confidence": 1.0,
+                "confidence_threshold": float(
+                    state.get(
+                        "confidence_threshold",
+                        0.5,
+                    )
+                ),
+                "human_escalation_required": False,
+                "escalation_required": False,
+                "escalation_reason": "",
+                "replan_required": False,
+                "resume_node": "",
+                "resume_subtask_id": None,
+                "human_decision_status": "",
+                "human_decision": None,
+                "human_feedback": None,
+                "resume_from_human": False,
+                "execution_status": "running",
+                "error": "",
+            }
+
+        # ========================================================
+        # Normal execution
+        # ========================================================
 
         agent_input = AgentInput(
             task_id=state["task_id"],
@@ -965,12 +1388,10 @@ def build_workflow(
                     "long_term_memories",
                     [],
                 ),
-
                 "human_feedback": state.get(
                     "human_feedback",
                     "",
                 ),
-
                 "replan_required": state.get(
                     "replan_required",
                     False,
@@ -982,6 +1403,14 @@ def build_workflow(
             agent_input
         )
 
+        if persist_plan_subtasks is not None:
+            await persist_plan_subtasks(
+                execution_id=UUID(
+                    state["execution_id"]
+                ),
+                subtasks=plan.subtasks,
+            )
+
         completed_ids: set[str] = set()
 
         ready = _get_ready_subtasks(
@@ -992,63 +1421,38 @@ def build_workflow(
         if working_memory is not None:
             await working_memory.set_plan(
                 state["task_id"],
-                plan.model_dump(
-                    mode="json"
-                ),
+                plan.model_dump(mode="json"),
             )
 
         return {
             "plan": plan,
-
             "ready_subtasks": ready,
-
             "completed_subtasks": [],
-
             "specialist_outputs": [],
-
             "retry_count": 0,
-
             "failure_reason": "",
-
             "retry_feedback": "",
-
             "review_retry_count": 0,
-
             "review_feedback": "",
-
             "review": None,
-
             "specialist_confidence": 1.0,
-
             "confidence_threshold": float(
                 state.get(
                     "confidence_threshold",
                     0.5,
                 )
             ),
-
             "human_escalation_required": False,
-
             "escalation_required": False,
-
             "escalation_reason": "",
-
             "replan_required": False,
-
             "resume_node": "",
-
             "resume_subtask_id": None,
-
             "human_decision_status": "",
-
             "human_decision": None,
-
             "human_feedback": None,
-
             "resume_from_human": False,
-
             "execution_status": "running",
-
             "error": "",
         }
 
@@ -1087,10 +1491,24 @@ def build_workflow(
             )
         }
 
-        ready_subtasks = _get_ready_subtasks(
-            plan,
-            completed_ids,
-        )
+        if state.get("replay_only", False):
+            replay_target = _get_replay_target_subtask(
+                plan,
+                state,
+            )
+
+            if replay_target is None:
+                raise RuntimeError(
+                    "Selected replay span could not be mapped to "
+                    "a subtask in the replay plan."
+                )
+
+            ready_subtasks = [replay_target]
+        else:
+            ready_subtasks = _get_ready_subtasks(
+                plan,
+                completed_ids,
+            )
 
         sends: list[Send] = []
 
@@ -1104,6 +1522,56 @@ def build_workflow(
                 ),
 
                 "description": state["description"],
+                "context": dict(
+                    state.get(
+                        "context",
+                        {},
+                    )
+                    or {}
+                ),
+
+                "replay_source_execution_id": state.get(
+                    "replay_source_execution_id"
+                ),
+
+                "replay_source_span_id": state.get(
+                    "replay_source_span_id"
+                ),
+
+                "replay_target_subtask_id": state.get(
+                    "replay_target_subtask_id"
+                ),
+
+                "replay_target_subtask_description": state.get(
+                    "replay_target_subtask_description"
+                ),
+
+                "replay_target_specialist": state.get(
+                    "replay_target_specialist"
+                ),
+
+                "replay_target_span_name": state.get(
+                    "replay_target_span_name"
+                ),
+
+                "replay_target_span_kind": state.get(
+                    "replay_target_span_kind"
+                ),
+
+                "replay_source_subtask": state.get(
+                    "replay_source_subtask"
+                ),
+
+                "replay_only": bool(
+                    state.get(
+                        "replay_only",
+                        False,
+                    )
+                ),
+
+                "replay_input_override": state.get(
+                    "replay_input_override"
+                ),
 
                 "plan": plan,
 
@@ -1193,47 +1661,159 @@ def build_workflow(
                 "Specialist branch received no current_subtask."
             )
 
+        # A replay override can be supplied directly with an exact
+        # replay_target_subtask_id even when replay_only is omitted.
+        # This is required for direct workflow/unit-test invocation
+        # and is also safe for normal execution because the target
+        # must explicitly match the current subtask UUID.
+        is_replay_target = _replay_subtask_matches(
+            subtask,
+            state,
+        )
+
+        if (
+            state.get(
+                "replay_only",
+                False,
+            )
+            and not is_replay_target
+        ):
+            raise RuntimeError(
+                "Replay specialist branch received a subtask "
+                "that does not match the selected source subtask."
+            )
+
+        replay_override = (
+            state.get(
+                "replay_input_override"
+            )
+            if is_replay_target
+            else None
+        )
+
+        specialist_description = (
+            subtask.description
+        )
+
+        specialist_context = {
+
+            **dict(
+                state.get(
+                    "context",
+                    {},
+                )
+                or {}
+            ),
+            "required_inputs": (
+                subtask.required_inputs
+            ),
+
+            "long_term_memories": state.get(
+                "long_term_memories",
+                [],
+            ),
+
+            "expected_output": (
+                subtask.expected_output
+            ),
+
+            "completed_outputs": state.get(
+                "specialist_outputs",
+                [],
+            ),
+
+            "retry_count": state.get(
+                "retry_count",
+                0,
+            ),
+
+            "retry_feedback": state.get(
+                "retry_feedback",
+                "",
+            ),
+
+            "review_feedback": state.get(
+                "review_feedback",
+                "",
+            ),
+        }
+
+        if is_replay_target:
+            if isinstance(
+                replay_override,
+                dict,
+            ):
+                if (
+                    replay_override.get(
+                        "description"
+                    )
+                    is not None
+                ):
+                    specialist_description = str(
+                        replay_override[
+                            "description"
+                        ]
+                    )
+
+                override_context = (
+                    replay_override.get(
+                        "context"
+                    )
+                )
+
+                if isinstance(
+                    override_context,
+                    dict,
+                ):
+                    specialist_context.update(
+                        override_context
+                    )
+
+                specialist_context[
+                    "replay_override"
+                ] = replay_override
+
+            elif replay_override is not None:
+                specialist_description = str(
+                    replay_override
+                )
+
+            specialist_context[
+                "replay"
+            ] = True
+
+            specialist_context[
+                "replay_source_execution_id"
+            ] = state.get(
+                "replay_source_execution_id"
+            )
+
+            specialist_context[
+                "replay_source_span_id"
+            ] = state.get(
+                "replay_source_span_id"
+            )
+
+            specialist_context[
+                "replay_source_subtask_id"
+            ] = state.get(
+                "replay_target_subtask_id"
+            )
+
+            specialist_context[
+                "replay_subtask_id"
+            ] = str(
+                subtask.id
+            )
+
         agent_input = AgentInput(
             task_id=state["task_id"],
 
             subtask_id=subtask.id,
 
-            description=subtask.description,
+            description=specialist_description,
 
-            context={
-                "required_inputs": (
-                    subtask.required_inputs
-                ),
-
-                "long_term_memories": state.get(
-                    "long_term_memories",
-                    [],
-                ),
-
-                "expected_output": (
-                    subtask.expected_output
-                ),
-
-                "completed_outputs": state.get(
-                    "specialist_outputs",
-                    [],
-                ),
-
-                "retry_count": state.get(
-                    "retry_count",
-                    0,
-                ),
-
-                "retry_feedback": state.get(
-                    "retry_feedback",
-                    "",
-                ),
-
-                "review_feedback": state.get(
-                    "review_feedback",
-                    "",
-                ),
-            },
+            context=specialist_context,
         )
 
         agent_map = {
@@ -1767,6 +2347,50 @@ def build_workflow(
             f"Invalid human decision: {decision!r}"
         )
     # ========================================================
+    # Selected-span replay finalization
+    # ========================================================
+
+    def replay_finalize(
+        state: AgentGraphState,
+    ) -> dict[str, Any]:
+        """
+        Terminal boundary for selected-span replay.
+
+        A selected replay ends immediately after the selected specialist
+        succeeds. It must never enter review, reviewer retry, synthesis,
+        or another specialist branch.
+        """
+
+        if not state.get("replay_only", False):
+            raise RuntimeError(
+                "replay_finalize can only be reached by a selected-span replay."
+            )
+
+        outputs = state.get("specialist_outputs", [])
+
+        if not outputs:
+            return {
+                "execution_status": "failed",
+                "error": (
+                    "Selected replay target completed without "
+                    "producing a specialist output."
+                ),
+            }
+
+        latest_output = outputs[-1]
+
+        return {
+            "final_output": str(
+                latest_output.get("content", "")
+            ),
+            "execution_status": "completed",
+            "human_escalation_required": False,
+            "escalation_required": False,
+            "human_decision_status": "completed",
+            "error": "",
+        }
+
+    # ========================================================
     # Review
     # ========================================================
 
@@ -2012,67 +2636,131 @@ def build_workflow(
     # ========================================================
     # Graph nodes
     # ========================================================
+    # Every node is wrapped so workflow-level spans are visible
+    # beneath the root execution span created by tasks/execution.py.
     graph.add_node(
         "check_user_escalation",
-        check_user_escalation,
+        _traced_node(
+            "check_user_escalation",
+            check_user_escalation,
+        ),
     )
+
     graph.add_node(
         "user_request_escalation",
-        user_request_escalation,
+        _traced_node(
+            "user_request_escalation",
+            user_request_escalation,
+            kind="human_escalation",
+        ),
     )
+
     graph.add_node(
         "retrieve_long_term_memory",
-        retrieve_long_term_memory,
+        _traced_node(
+            "retrieve_long_term_memory",
+            retrieve_long_term_memory,
+            kind="memory",
+        ),
     )
 
     graph.add_node(
         "planning",
-        planning,
+        _traced_node(
+            "planning",
+            planning,
+            kind="planning",
+        ),
     )
 
     graph.add_node(
         "specialist",
-        specialist,
+        _traced_node(
+            "specialist",
+            specialist,
+            kind="specialist",
+        ),
     )
 
     graph.add_node(
         "retry_specialist",
-        retry_specialist,
+        _traced_node(
+            "retry_specialist",
+            retry_specialist,
+            kind="retry",
+        ),
     )
 
     graph.add_node(
         "human_escalation",
-        human_escalation,
+        _traced_node(
+            "human_escalation",
+            human_escalation,
+            kind="human_escalation",
+        ),
     )
 
     graph.add_node(
         "resume_after_human",
-        _resume_after_human,
+        _traced_node(
+            "resume_after_human",
+            _resume_after_human,
+            kind="human_decision",
+        ),
+    )
+
+    graph.add_node(
+        "replay_finalize",
+        _traced_node(
+            "replay_finalize",
+            replay_finalize,
+            kind="replay_finalize",
+        ),
     )
 
     graph.add_node(
         "review",
-        review,
+        _traced_node(
+            "review",
+            review,
+            kind="review",
+        ),
     )
 
     graph.add_node(
         "escalate",
-        escalate,
+        _traced_node(
+            "escalate",
+            escalate,
+            kind="human_escalation",
+        ),
     )
 
     graph.add_node(
         "retry_after_review",
-        retry_after_review,
+        _traced_node(
+            "retry_after_review",
+            retry_after_review,
+            kind="retry",
+        ),
     )
 
     graph.add_node(
         "review_failed",
-        review_failed,
+        _traced_node(
+            "review_failed",
+            review_failed,
+            kind="failure",
+        ),
     )
 
     graph.add_node(
         "synthesis",
-        synthesis,
+        _traced_node(
+            "synthesis",
+            synthesis,
+            kind="synthesis",
+        ),
     )
 
     # ========================================================
@@ -2176,6 +2864,8 @@ def build_workflow(
             "failed": "review",
 
             "human_escalation": "human_escalation",
+
+            "replay_finalize": "replay_finalize",
         },
     )
 
@@ -2197,6 +2887,11 @@ def build_workflow(
     )
     graph.add_edge(
         "human_escalation",
+        END,
+    )
+
+    graph.add_edge(
+        "replay_finalize",
         END,
     )
 
