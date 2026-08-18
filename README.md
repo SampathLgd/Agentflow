@@ -10,7 +10,7 @@
 Watch the complete walkthrough here:
 
 ```
-[(https://www.loom.com/share/a0ce9ebb3646482cada73dcc8d312b6b)](https://www.loom.com/share/a0ce9ebb3646482cada73dcc8d312b6b)
+https://www.loom.com/share/a0ce9ebb3646482cada73dcc8d312b6b
 ```
 ---
 ## Project Description
